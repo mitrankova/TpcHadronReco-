@@ -1,5 +1,7 @@
 AUTOMAKE_OPTIONS = foreign
 
+# Install of the coresoftware branch with tpctrackreco + sitrackreco
+# (crossing-vertex-si-assoc).  Override with: make TPC_POLY_INSTALL=/path
 TPC_POLY_INSTALL = /sphenix/u/mitrankov/install_PR_3D
 
 AM_CPPFLAGS = \
@@ -28,6 +30,7 @@ lib_LTLIBRARIES = libTpcHadronReco.la
 
 libTpcHadronReco_la_SOURCES = \
   TpcV0CandidateTree.cc \
+  TpcV0CandidateTreeSiTpc.cc \
   TpcTrackActsFitter.cc \
   TpcTrackHelixFitter.cc \
   TpcTrackKalmanFitter.cc
@@ -57,7 +60,8 @@ libTpcHadronReco_la_LIBADD = \
   -lActsCore \
   -ltrackeralign \
   -ltrackbase_historic_io \
-  -ltpctrackreco
+  -ltpctrackreco \
+  -lsitrackreco
 
 clean-local:
 	rm -f $(BUILT_SOURCES)

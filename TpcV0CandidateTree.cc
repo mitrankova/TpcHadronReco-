@@ -11,6 +11,8 @@
 #include "TpcTrackHelixFitter.h"
 #include "TpcTrackKalmanFitter.h"
 
+#include <sitrackreco/SiTpc_TrackContainer.h>
+
 #include <trackbase/TrkrDefs.h>
 
 #include <g4main/PHG4EventHeader.h>
@@ -428,6 +430,15 @@ namespace tpchadronreco
                    { return static_cast<char>(std::tolower(ch)); });
 
     m_fit_acts_tracks = false;
+    m_use_sitpc_native_helix = false;
+    if (lowered == "sitpc" || lowered == "native" || lowered == "sitpc-native")
+    {
+      // Si+TPC combined helix of SiTpcTrackMatcher, no refit (needs use_sitpc_tracks).
+      set_fit_helix(true);
+      m_use_final_track_helix = false;
+      m_use_sitpc_native_helix = true;
+      return true;
+    }
     if (lowered == "helix" || lowered == "circle")
     {
       set_fit_helix(true);
@@ -452,7 +463,7 @@ namespace tpchadronreco
     }
 
     std::cerr << PHWHERE << Name() << ": unknown track fit method '" << mode
-              << "'. Valid methods are helix, kalman, acts, and line." << std::endl;
+              << "'. Valid methods are helix, kalman, acts, line, and sitpc." << std::endl;
     return false;
   }
 
@@ -663,6 +674,11 @@ namespace tpchadronreco
     unsigned int corrected_points = 0;
     for (auto &point : points)
     {
+      // MVTX/INTT layer points (Si-associated tracks) are not TPC measurements.
+      if (point.layer >= 0 && point.layer <= 6)
+      {
+        continue;
+      }
       ++m_counter_spatial_points_seen;
 
       const double radius = std::hypot(point.position.x, point.position.y);
@@ -755,6 +771,31 @@ namespace tpchadronreco
   int TpcV0CandidateTree::InitRun(PHCompositeNode *topNode)
   {
     m_acts_fitter.reset();
+    if (m_use_sitpc_tracks && m_fit_kalman_tracks && m_fit_acts_tracks)
+    {
+      std::cerr << PHWHERE << Name()
+                << ": fit method 'acts' builds TPC cluster surfaces only and cannot refit the"
+                << " Si+TPC tracks. Use 'sitpc' (combined helix), 'kalman', or 'helix'." << std::endl;
+      return Fun4AllReturnCodes::ABORTRUN;
+    }
+    if (m_use_sitpc_native_helix && !m_use_sitpc_tracks)
+    {
+      std::cerr << PHWHERE << Name()
+                << ": fit method 'sitpc' needs use_sitpc_tracks(true)." << std::endl;
+      return Fun4AllReturnCodes::ABORTRUN;
+    }
+    if (m_use_sitpc_tracks)
+    {
+      std::cout << Name() << ": Si-associated tracks from " << m_sitpc_track_node
+                << " (fit=" << (m_use_sitpc_native_helix ? "sitpc-native" : (m_fit_kalman_tracks ? "kalman" : (m_fit_helix_tracks ? "helix" : "line")))
+                << ", min MVTX/INTT/Si/TPC = " << m_sitpc_min_mvtx << "/" << m_sitpc_min_intt
+                << "/" << m_sitpc_min_si_points << "/" << m_sitpc_min_tpc_points
+                << ", max tier " << m_sitpc_max_crossing_tier
+                << ", vertex " << (m_sitpc_vertex_mode == SiTpcVertexMode::Resolver ? "resolver" : (m_sitpc_vertex_mode == SiTpcVertexMode::Tracks ? "tracks" : "fixed"))
+                << ", unmatched TPC tracks " << (m_sitpc_add_unmatched_tpc_tracks ? "on" : "off")
+                << ", D0 displaced selection " << (m_d0_displaced_cuts.enabled ? "on" : "off")
+                << ")" << std::endl;
+    }
     if (m_fit_kalman_tracks && m_fit_acts_tracks)
     {
       m_acts_fitter = TpcTrackActsFitter::create(topNode);
@@ -823,7 +864,54 @@ namespace tpchadronreco
     std::map<int, Tracklet> tracklet_map;
 
     const auto track_build_start = std::chrono::steady_clock::now();
-    if (m_use_pattern_cluster_tracks)
+    if (m_use_sitpc_tracks)
+    {
+      const auto *sitpc_tracks = findNode::getClass<SiTpc_TrackContainer>(
+          topNode, m_sitpc_track_node);
+      auto *tpc_tracks = findNode::getClass<Tpc_PolyTrackContainer>(
+          topNode, m_tpc_sa_track_node);
+      const auto *crossing_decisions = findNode::getClass<TpcCrossingDecisionContainer>(
+          topNode, m_tpc_crossing_decision_node);
+      if (!sitpc_tracks)
+      {
+        if (Verbosity() > 0)
+        {
+          std::cout << PHWHERE << Name() << ": missing Si+TPC track node "
+                    << m_sitpc_track_node << std::endl;
+        }
+        return Fun4AllReturnCodes::EVENT_OK;
+      }
+      if (!crossing_decisions && Verbosity() > 0)
+      {
+        std::cout << PHWHERE << Name() << ": missing crossing decision node "
+                  << m_tpc_crossing_decision_node
+                  << "; Si+TPC tracks have no collision vertex" << std::endl;
+      }
+      tracklet_map = build_sitpc_tracklets(sitpc_tracks, tpc_tracks, crossing_decisions);
+
+      if (m_sitpc_add_unmatched_tpc_tracks)
+      {
+        auto *clusters = findNode::getClass<Tpc_PolyClusterContainer>(
+            topNode, m_tpc_sa_cluster_node);
+        if (clusters && tpc_tracks)
+        {
+          auto tpc_only = build_pattern_tracklets(clusters, tpc_tracks, crossing_decisions);
+          for (auto &entry : tpc_only)
+          {
+            // Si tracklets are keyed by their TPC poly-track id: a TPC track with
+            // an accepted Si match is used once, as the Si+TPC track.
+            tracklet_map.emplace(entry.first, std::move(entry.second));
+          }
+        }
+        else if (Verbosity() > 0)
+        {
+          std::cout << PHWHERE << Name() << ": missing " << m_tpc_sa_cluster_node << "/"
+                    << m_tpc_sa_track_node << "; no unmatched TPC tracks added" << std::endl;
+        }
+      }
+      assign_sitpc_collision_vertices(tracklet_map);
+    }
+    else if (m_use_pattern_cluster_tracks)
     {
       auto *clusters = findNode::getClass<Tpc_PolyClusterContainer>(
           topNode, m_tpc_sa_cluster_node);
@@ -899,7 +987,9 @@ namespace tpchadronreco
           tracklet, Vec3{0.0, 0.0, 0.0}, tracklet.beamline_pca, tracklet.rdca_zero);
       // The current pattern vertexer is not used for individual-track DCA.
       tracklet.has_pattern_vertex = false;
-      tracklet.vertex_dca = fitted_track_dca_to_vertex(tracklet, primary_vertex);
+      // Si+TPC tracks: the vertex of the track's own collision.
+      const Vec3 &track_vertex = tracklet_primary_vertex(tracklet, primary_vertex);
+      tracklet.vertex_dca = fitted_track_dca_to_vertex(tracklet, track_vertex);
       tracklet.has_vertex_dca =
           std::isfinite(tracklet.vertex_dca.first) &&
           std::isfinite(tracklet.vertex_dca.second);
@@ -914,7 +1004,7 @@ namespace tpchadronreco
         tracklet.has_primary_constrained_momentum =
             primary_vertex_constrained_momentum(
                 tracklet,
-                primary_vertex,
+                track_vertex,
                 tracklet.primary_constrained_momentum,
                 tracklet.primary_constraint_chi2,
                 tracklet.primary_constraint_path_cm);
@@ -944,13 +1034,14 @@ namespace tpchadronreco
     const auto track_qa_start = std::chrono::steady_clock::now();
     for (const auto *tracklet : tracklets)
     {
+      const Vec3 &track_vertex = tracklet_primary_vertex(*tracklet, primary_vertex);
       if (m_write_track_tree)
       {
-        fill_track_row(*tracklet, primary_vertex, run_number, event_number);
+        fill_track_row(*tracklet, track_vertex, run_number, event_number);
       }
       if (m_cluster_residual_tree)
       {
-        fill_cluster_residual_rows(*tracklet, primary_vertex, run_number, event_number);
+        fill_cluster_residual_rows(*tracklet, track_vertex, run_number, event_number);
       }
     }
     const double track_qa_seconds = std::chrono::duration<double>(
@@ -965,56 +1056,52 @@ namespace tpchadronreco
                 << std::endl;
     }
 
-    std::vector<LambdaCandidate> lambda_candidates;
-    if (m_sigma1385_cuts.enabled || m_xi_cuts.enabled || m_omega_cuts.enabled)
+    // Pair / hyperon stage.  Si+TPC tracks with set_require_same_crossing:
+    // one pass per collision (resolved crossing) with that collision's vertex.
+    std::vector<std::pair<Vec3, std::vector<const Tracklet *>>> collision_groups;
+    if (m_use_sitpc_tracks && m_require_same_crossing)
     {
-      lambda_candidates.reserve(tracklets.size());
+      std::map<std::pair<int, short>, std::size_t> group_index;
+      for (const auto *tracklet : tracklets)
+      {
+        const std::pair<int, short> key{tracklet->crossing_valid ? 1 : 0,
+                                        tracklet->crossing_valid ? tracklet->crossing
+                                                                 : static_cast<short>(0)};
+        auto iter = group_index.find(key);
+        if (iter == group_index.end())
+        {
+          iter = group_index.emplace(key, collision_groups.size()).first;
+          collision_groups.emplace_back(tracklet_primary_vertex(*tracklet, primary_vertex),
+                                        std::vector<const Tracklet *>{});
+        }
+        collision_groups[iter->second].second.push_back(tracklet);
+      }
+    }
+    else
+    {
+      collision_groups.emplace_back(primary_vertex, tracklets);
     }
 
     const auto pair_loop_start = std::chrono::steady_clock::now();
     std::uint64_t event_pairs_processed = 0;
-    const std::uint64_t event_pairs_total =
-        tracklets.size() > 1
-            ? static_cast<std::uint64_t>(tracklets.size()) *
-                  static_cast<std::uint64_t>(tracklets.size() - 1) / 2
-            : 0;
+    std::uint64_t event_pairs_total = 0;
+    for (const auto &group : collision_groups)
+    {
+      const auto n = static_cast<std::uint64_t>(group.second.size());
+      event_pairs_total += n > 1 ? n * (n - 1) / 2 : 0;
+    }
     if (m_print_timing)
     {
       std::cout << "[V0TimingStage] run=" << run_number
                 << " event=" << event_number
                 << " stage=pair_loop_start"
                 << " pairs=" << event_pairs_total
+                << " collisions=" << collision_groups.size()
                 << std::endl;
     }
-    for (std::size_t i = 0; i < tracklets.size(); ++i)
+    for (const auto &group : collision_groups)
     {
-      for (std::size_t j = i + 1; j < tracklets.size(); ++j)
-      {
-        make_pair_row(*tracklets[i], *tracklets[j], primary_vertex, run_number, event_number,
-                      &lambda_candidates);
-        ++event_pairs_processed;
-        if (m_print_timing &&
-            (event_pairs_processed == 1 || event_pairs_processed % 1000 == 0))
-        {
-          std::cout << "[V0TimingPair] run=" << run_number
-                    << " event=" << event_number
-                    << " done=" << event_pairs_processed
-                    << " total=" << event_pairs_total
-                    << " pair_loop_s=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - pair_loop_start).count()
-                    << " kalman_pca_s=" << (m_timing_kalman_pca_seconds - kalman_pca_before)
-                    << std::endl;
-        }
-      }
-    }
-    if (m_sigma_tree && !lambda_candidates.empty())
-    {
-      reconstruct_sigma_candidates(lambda_candidates, tracklets, primary_vertex,
-                                   run_number, event_number);
-    }
-    if (m_cascade_tree && !lambda_candidates.empty())
-    {
-      reconstruct_cascade_candidates(lambda_candidates, tracklets, primary_vertex,
-                                     run_number, event_number);
+      run_pair_stage(group.second, group.first, run_number, event_number, event_pairs_processed);
     }
 
     const double pair_loop_seconds = std::chrono::duration<double>(
@@ -1053,6 +1140,47 @@ namespace tpchadronreco
     return Fun4AllReturnCodes::EVENT_OK;
   }
 
+  void TpcV0CandidateTree::run_pair_stage(const std::vector<const Tracklet *> &tracklets,
+                                          const Vec3 &primary_vertex,
+                                          const int run_number,
+                                          const int event_number,
+                                          std::uint64_t &pairs_processed)
+  {
+    std::vector<LambdaCandidate> lambda_candidates;
+    if (m_sigma1385_cuts.enabled || m_xi_cuts.enabled || m_omega_cuts.enabled)
+    {
+      lambda_candidates.reserve(tracklets.size());
+    }
+
+    for (std::size_t i = 0; i < tracklets.size(); ++i)
+    {
+      for (std::size_t j = i + 1; j < tracklets.size(); ++j)
+      {
+        make_pair_row(*tracklets[i], *tracklets[j], primary_vertex, run_number, event_number,
+                      &lambda_candidates);
+        ++pairs_processed;
+        if (m_print_timing && (pairs_processed == 1 || pairs_processed % 1000 == 0))
+        {
+          std::cout << "[V0TimingPair] run=" << run_number
+                    << " event=" << event_number
+                    << " done=" << pairs_processed
+                    << " kalman_pca_s_total=" << m_timing_kalman_pca_seconds
+                    << std::endl;
+        }
+      }
+    }
+    if (m_sigma_tree && !lambda_candidates.empty())
+    {
+      reconstruct_sigma_candidates(lambda_candidates, tracklets, primary_vertex,
+                                   run_number, event_number);
+    }
+    if (m_cascade_tree && !lambda_candidates.empty())
+    {
+      reconstruct_cascade_candidates(lambda_candidates, tracklets, primary_vertex,
+                                     run_number, event_number);
+    }
+  }
+
   int TpcV0CandidateTree::End(PHCompositeNode * /*topNode*/)
   {
     if (m_file)
@@ -1070,11 +1198,16 @@ namespace tpchadronreco
                                       std::to_string(m_spatial_correction_scale))
                                          .c_str());
       spatial_status_metadata.Write();
-      const std::string fit_method = m_fit_kalman_tracks ? (m_fit_acts_tracks ? "acts" : "kalman")
-                                                         : (m_fit_helix_tracks ? "helix" : "line");
+      const std::string fit_method = m_use_sitpc_native_helix
+                                         ? "sitpc-native"
+                                         : (m_fit_kalman_tracks ? (m_fit_acts_tracks ? "acts" : "kalman")
+                                                                : (m_fit_helix_tracks ? "helix" : "line"));
       TNamed reco_metadata(
           "tpc_hadron_reco_config",
           (std::string("fit=") + fit_method +
+           ";tracks=" + (m_use_sitpc_tracks ? (m_sitpc_add_unmatched_tpc_tracks ? "sitpc+tpc" : "sitpc")
+                                            : (m_use_pattern_cluster_tracks ? "tpc" : "truth")) +
+           ";d0_displaced=" + (m_d0_displaced_cuts.enabled ? "1" : "0") +
            ";sigma1385=" + (m_sigma1385_cuts.enabled ? "1" : "0") +
            ";xi=" + (m_xi_cuts.enabled ? "1" : "0") +
            ";omega=" + (m_omega_cuts.enabled ? "1" : "0") +
@@ -1082,6 +1215,17 @@ namespace tpchadronreco
            (m_use_nominal_lambda_mass_for_composites ? "1" : "0"))
               .c_str());
       reco_metadata.Write();
+      if (m_use_sitpc_tracks)
+      {
+        std::cout << Name() << ": Si+TPC tracks seen=" << m_counter_sitpc_seen
+                  << " accepted=" << m_counter_sitpc_accepted
+                  << " rejected(fit)=" << m_counter_sitpc_reject_fit
+                  << " rejected(quality)=" << m_counter_sitpc_reject_quality
+                  << " rejected(crossing)=" << m_counter_sitpc_reject_crossing
+                  << " collision vertices resolver/tracks/fixed="
+                  << m_counter_sitpc_vertex_resolver << "/" << m_counter_sitpc_vertex_tracks
+                  << "/" << m_counter_sitpc_vertex_fixed << std::endl;
+      }
       if (m_pair_tree)
       {
         m_pair_tree->Write();
@@ -1983,12 +2127,14 @@ namespace tpchadronreco
   }
 
   bool TpcV0CandidateTree::make_pair_row(const Tracklet &track1, const Tracklet &track2,
-                                         const Vec3 &primary_vertex,
+                                         const Vec3 &event_vertex,
                                          const int run_number,
                                          const int event_number,
                                          std::vector<LambdaCandidate> *lambda_candidates)
   {
     ++m_counter_raw_pairs;
+    // Si+TPC tracks: vertex of the pair's collision; otherwise the event vertex.
+    const Vec3 primary_vertex = pair_primary_vertex(track1, track2, event_vertex);
 
     if (m_require_same_crossing && track1.crossing_valid && track2.crossing_valid &&
         track1.crossing != track2.crossing)
@@ -2466,6 +2612,16 @@ namespace tpchadronreco
     {
       ++m_counter_reject_pointing;
     }
+
+    // Displaced two-track vertex (D0) w.r.t. the collision vertex.  Only a real
+    // daughter-daughter PCA defines a secondary vertex.
+    DisplacedPair displaced = displaced_pair(pair_vertex, total_mom, primary_vertex,
+                                             primary_pca1, primary_mom1,
+                                             primary_pca2, primary_mom2,
+                                             have_primary_pair);
+    displaced.valid = displaced.valid && have_secondary_pca;
+    const bool pass_d0_displaced =
+        passes_d0_displaced_selection(displaced, dca1, dca2, pair_dca);
 
     const Vec3 &truth_pplus = (track1.charge > 0) ? track1.truth_momentum : track2.truth_momentum;
     const Vec3 &truth_pminus = (track1.charge > 0) ? track2.truth_momentum : track1.truth_momentum;
@@ -2970,8 +3126,8 @@ namespace tpchadronreco
             primary_vertex, primary_pca1, primary_pca2, d0_selection_mom1, d0_selection_mom2,
             have_primary_pair, dca1, dca2, prompt_selection_pair_dca,
             nan, nan, pi1k2_selection_mass, false);
-        if (pass_k1pi2) m_pair.candidate_mask |= CandidateD0;
-        if (pass_pi1k2) m_pair.candidate_mask |= CandidateAntiD0;
+        if (pass_k1pi2 && pass_d0_displaced) m_pair.candidate_mask |= CandidateD0;
+        if (pass_pi1k2 && pass_d0_displaced) m_pair.candidate_mask |= CandidateAntiD0;
       }
     }
     else
@@ -2981,8 +3137,8 @@ namespace tpchadronreco
       if (pass_antilambda) m_pair.candidate_mask |= CandidateAntiLambda;
       if (pass_phi) m_pair.candidate_mask |= CandidatePhi;
       if (pass_jpsi) m_pair.candidate_mask |= CandidateJpsi;
-      if (pass_d0) m_pair.candidate_mask |= CandidateD0;
-      if (pass_antid0) m_pair.candidate_mask |= CandidateAntiD0;
+      if (pass_d0 && pass_d0_displaced) m_pair.candidate_mask |= CandidateD0;
+      if (pass_antid0 && pass_d0_displaced) m_pair.candidate_mask |= CandidateAntiD0;
     }
 
     if (m_pair.candidate_mask == 0U)
@@ -3056,6 +3212,59 @@ namespace tpchadronreco
     m_pair.npoints2 = static_cast<short>(track2.npoints);
     m_pair.ntpc_clusters1 = track1.ntpc_clusters;
     m_pair.ntpc_clusters2 = track2.ntpc_clusters;
+
+    m_pair.has_si1 = track1.has_si ? 1 : 0;
+    m_pair.has_si2 = track2.has_si ? 1 : 0;
+    m_pair.nmvtx1 = track1.n_mvtx;
+    m_pair.nmvtx2 = track2.n_mvtx;
+    m_pair.nintt1 = track1.n_intt;
+    m_pair.nintt2 = track2.n_intt;
+    m_pair.crossing_tier1 = static_cast<int>(track1.crossing_tier);
+    m_pair.crossing_tier2 = static_cast<int>(track2.crossing_tier);
+    if (track1.has_si)
+    {
+      m_pair.sitpc_tpc_z_offset1 = static_cast<float>(track1.sitpc_tpc_z_offset);
+      m_pair.sitpc_circle_rms1 = static_cast<float>(track1.sitpc_circle_rms);
+      m_pair.sitpc_z_rms1 = static_cast<float>(track1.sitpc_z_rms);
+    }
+    if (track2.has_si)
+    {
+      m_pair.sitpc_tpc_z_offset2 = static_cast<float>(track2.sitpc_tpc_z_offset);
+      m_pair.sitpc_circle_rms2 = static_cast<float>(track2.sitpc_circle_rms);
+      m_pair.sitpc_z_rms2 = static_cast<float>(track2.sitpc_z_rms);
+    }
+    m_pair.pv_x = static_cast<float>(primary_vertex.x);
+    m_pair.pv_y = static_cast<float>(primary_vertex.y);
+    m_pair.pv_z = static_cast<float>(primary_vertex.z);
+    {
+      const Tracklet &vertex_track = track1.has_collision_vertex ? track1 : track2;
+      m_pair.pv_source = vertex_track.has_collision_vertex ? vertex_track.collision_vertex_source : 0;
+      m_pair.pv_ntracks = vertex_track.has_collision_vertex ? vertex_track.collision_vertex_ntracks : 0;
+    }
+
+    m_pair.signed_dca_xy1 = static_cast<float>(displaced.signed_dca_xy1);
+    m_pair.signed_dca_xy2 = static_cast<float>(displaced.signed_dca_xy2);
+    m_pair.dca_product = static_cast<float>(displaced.dca_product);
+    if (displaced.valid)
+    {
+      m_pair.lxy = static_cast<float>(displaced.lxy);
+      m_pair.lxy_signed = static_cast<float>(displaced.lxy_signed);
+      m_pair.decay_length = static_cast<float>(displaced.decay_length);
+      m_pair.pointing_dca_xy = static_cast<float>(displaced.pointing_dca_xy);
+      m_pair.pointing_dca_3d = static_cast<float>(displaced.pointing_dca_3d);
+    }
+    if (have_secondary_pca)
+    {
+      // Masses with the momenta at the daughter-daughter PCA (secondary vertex).
+      m_pair.mass_D0_sv = static_cast<float>(
+          invariant_mass(negative_mom, kKaonMass, positive_mom, kPionMass));
+      m_pair.mass_AntiD0_sv = static_cast<float>(
+          invariant_mass(positive_mom, kKaonMass, negative_mom, kPionMass));
+      m_pair.mass_Phi_sv = static_cast<float>(
+          invariant_mass(secondary_mom1, kKaonMass, secondary_mom2, kKaonMass));
+    }
+    m_pair.d0_displaced_mask =
+        (displaced.valid && pass_d0_displaced) ? 0x3 : 0;
 
     const bool keep_kshort_details =
         m_write_kshort_daughter_details && pass_kshort &&
@@ -3826,6 +4035,20 @@ namespace tpchadronreco
       double &sigma_r_cm,
       double &sigma_z_cm) const
   {
+    if (layer >= 0 && layer <= 2)
+    {
+      sigma_rphi_cm = m_sigma_rphi_mvtx_cm;
+      sigma_r_cm = m_sigma_r_mvtx_cm;
+      sigma_z_cm = m_sigma_z_mvtx_cm;
+      return;
+    }
+    if (layer >= 3 && layer <= 6)
+    {
+      sigma_rphi_cm = m_sigma_rphi_intt_cm;
+      sigma_r_cm = m_sigma_r_intt_cm;
+      sigma_z_cm = m_sigma_z_intt_cm;
+      return;
+    }
     if (is_tpc_transition_layer(layer))
     {
       sigma_rphi_cm = m_sigma_rphi_transition_cm;
@@ -4133,6 +4356,28 @@ namespace tpchadronreco
 
     m_track.run = run_number;
     m_track.evt = event_number;
+    m_track.has_si = tracklet.has_si ? 1 : 0;
+    m_track.nmvtx = tracklet.n_mvtx;
+    m_track.nintt = tracklet.n_intt;
+    m_track.si_chain_id = tracklet.si_chain_id;
+    m_track.crossing_tier = static_cast<int>(tracklet.crossing_tier);
+    if (tracklet.has_si)
+    {
+      m_track.sitpc_dca = static_cast<float>(tracklet.sitpc_dca);
+      m_track.sitpc_circle_rms = static_cast<float>(tracklet.sitpc_circle_rms);
+      m_track.sitpc_z_rms = static_cast<float>(tracklet.sitpc_z_rms);
+      m_track.sitpc_tpc_z_offset = static_cast<float>(tracklet.sitpc_tpc_z_offset);
+      m_track.sitpc_match_chi2 = static_cast<float>(tracklet.sitpc_match_chi2);
+    }
+    if (tracklet.has_si_vertex_z)
+    {
+      m_track.si_vertex_z = static_cast<float>(tracklet.si_vertex_z);
+    }
+    m_track.pv_x = static_cast<float>(primary_vertex.x);
+    m_track.pv_y = static_cast<float>(primary_vertex.y);
+    m_track.pv_z = static_cast<float>(primary_vertex.z);
+    m_track.pv_source = tracklet.has_collision_vertex ? tracklet.collision_vertex_source : 0;
+    m_track.pv_ntracks = tracklet.has_collision_vertex ? tracklet.collision_vertex_ntracks : 0;
     m_track.track_id = tracklet.track_id;
     m_track.source_assembled_track_id = tracklet.source_assembled_track_id;
     m_track.crossing_valid = tracklet.crossing_valid ? 1 : 0;
@@ -4618,7 +4863,19 @@ namespace tpchadronreco
         {
           continue;
         }
-        chi2 += square(residual_rphi / sigma_rphi) + square(residual_z / sigma_z);
+        if (tracklet.has_si)
+        {
+          // Si + TPC points: per-point sigmas (MVTX ~10 um vs TPC ~250 um).
+          const double point_sigma_rphi = std::max(point.sigma_rphi_cm > 0.0 ? point.sigma_rphi_cm : sigma_rphi,
+                                                   m_kalman_config.min_measurement_sigma_cm);
+          const double point_sigma_z = std::max(point.sigma_z_cm > 0.0 ? point.sigma_z_cm : sigma_z,
+                                                m_kalman_config.min_measurement_sigma_cm);
+          chi2 += square(residual_rphi / point_sigma_rphi) + square(residual_z / point_sigma_z);
+        }
+        else
+        {
+          chi2 += square(residual_rphi / sigma_rphi) + square(residual_z / sigma_z);
+        }
         nresiduals += 2;
       }
 
@@ -4636,6 +4893,26 @@ namespace tpchadronreco
   {
     m_pair = {};
     const float nan = quiet_nan();
+    m_pair.sitpc_tpc_z_offset1 = nan;
+    m_pair.sitpc_tpc_z_offset2 = nan;
+    m_pair.sitpc_circle_rms1 = nan;
+    m_pair.sitpc_circle_rms2 = nan;
+    m_pair.sitpc_z_rms1 = nan;
+    m_pair.sitpc_z_rms2 = nan;
+    m_pair.pv_x = nan;
+    m_pair.pv_y = nan;
+    m_pair.pv_z = nan;
+    m_pair.signed_dca_xy1 = nan;
+    m_pair.signed_dca_xy2 = nan;
+    m_pair.dca_product = nan;
+    m_pair.lxy = nan;
+    m_pair.lxy_signed = nan;
+    m_pair.decay_length = nan;
+    m_pair.pointing_dca_xy = nan;
+    m_pair.pointing_dca_3d = nan;
+    m_pair.mass_D0_sv = nan;
+    m_pair.mass_AntiD0_sv = nan;
+    m_pair.mass_Phi_sv = nan;
     m_pair.primary_px1 = nan;
     m_pair.primary_py1 = nan;
     m_pair.primary_pz1 = nan;
@@ -4770,6 +5047,15 @@ namespace tpchadronreco
   {
     m_track = {};
     const float nan = quiet_nan();
+    m_track.sitpc_dca = nan;
+    m_track.sitpc_circle_rms = nan;
+    m_track.sitpc_z_rms = nan;
+    m_track.sitpc_tpc_z_offset = nan;
+    m_track.sitpc_match_chi2 = nan;
+    m_track.si_vertex_z = nan;
+    m_track.pv_x = nan;
+    m_track.pv_y = nan;
+    m_track.pv_z = nan;
     m_track.px = nan;
     m_track.py = nan;
     m_track.pz = nan;
@@ -5042,6 +5328,41 @@ namespace tpchadronreco
     tree->Branch("npoints2", &m_pair.npoints2, "npoints2/S");
     tree->Branch("ntpc_clusters1", &m_pair.ntpc_clusters1, "ntpc_clusters1/i");
     tree->Branch("ntpc_clusters2", &m_pair.ntpc_clusters2, "ntpc_clusters2/i");
+
+    // Si-associated tracks and the collision vertex
+    tree->Branch("has_si1", &m_pair.has_si1, "has_si1/I");
+    tree->Branch("has_si2", &m_pair.has_si2, "has_si2/I");
+    tree->Branch("nmvtx1", &m_pair.nmvtx1, "nmvtx1/i");
+    tree->Branch("nmvtx2", &m_pair.nmvtx2, "nmvtx2/i");
+    tree->Branch("nintt1", &m_pair.nintt1, "nintt1/i");
+    tree->Branch("nintt2", &m_pair.nintt2, "nintt2/i");
+    tree->Branch("crossing_tier1", &m_pair.crossing_tier1, "crossing_tier1/I");
+    tree->Branch("crossing_tier2", &m_pair.crossing_tier2, "crossing_tier2/I");
+    tree->Branch("sitpc_tpc_z_offset1", &m_pair.sitpc_tpc_z_offset1, "sitpc_tpc_z_offset1/F");
+    tree->Branch("sitpc_tpc_z_offset2", &m_pair.sitpc_tpc_z_offset2, "sitpc_tpc_z_offset2/F");
+    tree->Branch("sitpc_circle_rms1", &m_pair.sitpc_circle_rms1, "sitpc_circle_rms1/F");
+    tree->Branch("sitpc_circle_rms2", &m_pair.sitpc_circle_rms2, "sitpc_circle_rms2/F");
+    tree->Branch("sitpc_z_rms1", &m_pair.sitpc_z_rms1, "sitpc_z_rms1/F");
+    tree->Branch("sitpc_z_rms2", &m_pair.sitpc_z_rms2, "sitpc_z_rms2/F");
+    tree->Branch("pv_x", &m_pair.pv_x, "pv_x/F");
+    tree->Branch("pv_y", &m_pair.pv_y, "pv_y/F");
+    tree->Branch("pv_z", &m_pair.pv_z, "pv_z/F");
+    tree->Branch("pv_source", &m_pair.pv_source, "pv_source/I");
+    tree->Branch("pv_ntracks", &m_pair.pv_ntracks, "pv_ntracks/i");
+
+    // displaced two-track vertex (D0)
+    tree->Branch("signed_dca_xy1", &m_pair.signed_dca_xy1, "signed_dca_xy1/F");
+    tree->Branch("signed_dca_xy2", &m_pair.signed_dca_xy2, "signed_dca_xy2/F");
+    tree->Branch("dca_product", &m_pair.dca_product, "dca_product/F");
+    tree->Branch("lxy", &m_pair.lxy, "lxy/F");
+    tree->Branch("lxy_signed", &m_pair.lxy_signed, "lxy_signed/F");
+    tree->Branch("decay_length", &m_pair.decay_length, "decay_length/F");
+    tree->Branch("pointing_dca_xy", &m_pair.pointing_dca_xy, "pointing_dca_xy/F");
+    tree->Branch("pointing_dca_3d", &m_pair.pointing_dca_3d, "pointing_dca_3d/F");
+    tree->Branch("mass_D0_sv", &m_pair.mass_D0_sv, "mass_D0_sv/F");
+    tree->Branch("mass_AntiD0_sv", &m_pair.mass_AntiD0_sv, "mass_AntiD0_sv/F");
+    tree->Branch("mass_Phi_sv", &m_pair.mass_Phi_sv, "mass_Phi_sv/F");
+    tree->Branch("d0_displaced_mask", &m_pair.d0_displaced_mask, "d0_displaced_mask/I");
     tree->Branch("has_kshort_daughter_details",
                  &m_pair.has_kshort_daughter_details,
                  "has_kshort_daughter_details/I");
@@ -5196,6 +5517,22 @@ namespace tpchadronreco
     m_track_tree->Branch("side", &m_track.side, "side/I");
     m_track_tree->Branch("npoints", &m_track.npoints, "npoints/I");
     m_track_tree->Branch("ntpc_clusters", &m_track.ntpc_clusters, "ntpc_clusters/i");
+    m_track_tree->Branch("has_si", &m_track.has_si, "has_si/I");
+    m_track_tree->Branch("nmvtx", &m_track.nmvtx, "nmvtx/i");
+    m_track_tree->Branch("nintt", &m_track.nintt, "nintt/i");
+    m_track_tree->Branch("si_chain_id", &m_track.si_chain_id, "si_chain_id/I");
+    m_track_tree->Branch("crossing_tier", &m_track.crossing_tier, "crossing_tier/I");
+    m_track_tree->Branch("sitpc_dca", &m_track.sitpc_dca, "sitpc_dca/F");
+    m_track_tree->Branch("sitpc_circle_rms", &m_track.sitpc_circle_rms, "sitpc_circle_rms/F");
+    m_track_tree->Branch("sitpc_z_rms", &m_track.sitpc_z_rms, "sitpc_z_rms/F");
+    m_track_tree->Branch("sitpc_tpc_z_offset", &m_track.sitpc_tpc_z_offset, "sitpc_tpc_z_offset/F");
+    m_track_tree->Branch("sitpc_match_chi2", &m_track.sitpc_match_chi2, "sitpc_match_chi2/F");
+    m_track_tree->Branch("si_vertex_z", &m_track.si_vertex_z, "si_vertex_z/F");
+    m_track_tree->Branch("pv_x", &m_track.pv_x, "pv_x/F");
+    m_track_tree->Branch("pv_y", &m_track.pv_y, "pv_y/F");
+    m_track_tree->Branch("pv_z", &m_track.pv_z, "pv_z/F");
+    m_track_tree->Branch("pv_source", &m_track.pv_source, "pv_source/I");
+    m_track_tree->Branch("pv_ntracks", &m_track.pv_ntracks, "pv_ntracks/i");
     m_track_tree->Branch("has_helix", &m_track.has_helix, "has_helix/I");
     m_track_tree->Branch("has_kalman", &m_track.has_kalman, "has_kalman/I");
     m_track_tree->Branch("is_primary", &m_track.is_primary, "is_primary/I");

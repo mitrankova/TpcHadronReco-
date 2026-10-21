@@ -25,9 +25,12 @@ class Tpc_PolyClusterContainer;
 class Tpc_PolyTrackContainer;
 class Tpc_PolyTrackVertexContainer;
 class TpcCrossingDecisionContainer;
+class SiTpc_TrackContainer;
 
 namespace tpchadronreco
 {
+  class TpcTrackActsFitter;
+
   class TpcV0CandidateTree : public SubsysReco
   {
    public:
@@ -48,6 +51,130 @@ namespace tpchadronreco
     void set_tpc_sa_track_vertex_node(const std::string &name) { m_tpc_sa_track_vertex_node = name; }
     void set_tpc_crossing_decision_node(const std::string &name) { m_tpc_crossing_decision_node = name; }
     void set_require_same_crossing(const bool value = true) { m_require_same_crossing = value; }
+
+    // ------------------------------------------------------------------
+    // Si-associated tracks (MVTX/INTT + TPC, sitrackreco on the
+    // crossing-vertex-si-assoc branch).
+    //
+    // Input: SITPC_TRACKS (SiTpcTrackMatcher) + TPC_CROSSING_DECISIONS
+    // (TpcCrossingResolver) and, optionally, TPC_POLYTRACKS for dE/dx.
+    // Frame: the TPC frame of SiTpcBeamAlignment (beam on the TPC axis).
+    //
+    // Every tracklet carries the Si+TPC combined helix and the Si layer
+    // points plus its TPC clusters.  The primary vertex is per collision
+    // (one collision per crossing, TpcCrossingResolver): beam line in xy,
+    // the Si vertex z of the resolver in z.  Pairs are only formed inside
+    // one collision when set_require_same_crossing(true) (default).
+    //
+    // Track fit (set_track_fit_method):
+    //   "sitpc"/"native": the SiTpcTrackMatcher combined helix is used as is
+    //                     (no refit); pair PCAs use the analytic helix.
+    //   "kalman"        : Kalman/RKN refit of the Si + TPC points (field map,
+    //                     primary-vertex constrained phi/D0 masses available).
+    //   "helix"         : helix refit of the same points.
+    //   "acts" is not supported for Si tracks (TPC surfaces only).
+    // ------------------------------------------------------------------
+    void use_sitpc_tracks(const bool value = true) { m_use_sitpc_tracks = value; }
+    void set_sitpc_track_node(const std::string &name) { m_sitpc_track_node = name; }
+    // Also use the TPC-only tracks (TPC_POLYCLUSTERS / TPC_POLYTRACKS) that have no
+    // accepted Si match, e.g. for K0S / Lambda daughters born outside the MVTX.
+    // They share the collision vertex of their resolved crossing.
+    void set_sitpc_add_unmatched_tpc_tracks(const bool value = true)
+    {
+      m_sitpc_add_unmatched_tpc_tracks = value;
+    }
+    // Minimum MVTX / INTT / all-Si / TPC points and maximum xy and z rms of the
+    // combined fit [cm]. Negative rms values disable the rms cuts.
+    void set_sitpc_track_selection(const unsigned int min_mvtx,
+                                   const unsigned int min_intt,
+                                   const unsigned int min_si_points,
+                                   const unsigned int min_tpc_points,
+                                   const double max_circle_rms_cm = -1.0,
+                                   const double max_z_rms_cm = -1.0)
+    {
+      m_sitpc_min_mvtx = min_mvtx;
+      m_sitpc_min_intt = min_intt;
+      m_sitpc_min_si_points = min_si_points;
+      m_sitpc_min_tpc_points = min_tpc_points;
+      m_sitpc_max_circle_rms_cm = max_circle_rms_cm;
+      m_sitpc_max_z_rms_cm = max_z_rms_cm;
+    }
+    // Drop tracks whose resolved crossing tier is above this value (< 0: keep all).
+    void set_sitpc_max_crossing_tier(const int value) { m_sitpc_max_crossing_tier = value; }
+    // Drop tracks without a TPC_CROSSING_DECISIONS entry (default true).
+    void set_sitpc_require_crossing_decision(const bool value = true)
+    {
+      m_sitpc_require_crossing_decision = value;
+    }
+    // Drop tracks whose collision has no INTT-timed Si vertex (untimed lone tracks).
+    void set_sitpc_require_timed_collision(const bool value = true)
+    {
+      m_sitpc_require_timed_collision = value;
+    }
+    // Move the TPC points by the fitted TPC z offset into the Si z frame (default true).
+    void set_sitpc_apply_tpc_z_offset(const bool value = true) { m_sitpc_apply_tpc_z_offset = value; }
+    // Collision vertex: "resolver" (Si vertex z of TpcCrossingResolver, fallback
+    // to "tracks"), "tracks" (robust mean of the Si+TPC z at the beam of the
+    // prompt tracks of the collision), "fixed" (set_primary_vertex).
+    bool set_sitpc_vertex_mode(const std::string &mode);
+    void set_sitpc_vertex_track_selection(const double dca_xy_max_cm,
+                                          const double z_window_cm,
+                                          const unsigned int min_tracks)
+    {
+      m_sitpc_vertex_track_dca_xy_max_cm = dca_xy_max_cm;
+      m_sitpc_vertex_track_z_window_cm = z_window_cm;
+      m_sitpc_vertex_min_tracks = min_tracks;
+    }
+    // Beam line in the Si+TPC frame: x(z) = x0 + dxdz z, y(z) = y0 + dydz z [cm].
+    // Default (0, 0, 0, 0): SiTpcBeamAlignment with setCenterBeam(true).
+    void set_sitpc_beam_line(const double x0_cm, const double y0_cm,
+                             const double dxdz = 0.0, const double dydz = 0.0)
+    {
+      m_sitpc_beam_x0_cm = x0_cm;
+      m_sitpc_beam_y0_cm = y0_cm;
+      m_sitpc_beam_dxdz = dxdz;
+      m_sitpc_beam_dydz = dydz;
+    }
+    // Measurement sigmas of the Si layer points in the refit and in the
+    // helix fit quality [cm] (MVTX layers 0-2, INTT layers 3-6).
+    void set_si_measurement_sigmas(const double mvtx_rphi_cm, const double mvtx_r_cm,
+                                   const double mvtx_z_cm, const double intt_rphi_cm,
+                                   const double intt_r_cm, const double intt_z_cm)
+    {
+      m_sigma_rphi_mvtx_cm = mvtx_rphi_cm;
+      m_sigma_r_mvtx_cm = mvtx_r_cm;
+      m_sigma_z_mvtx_cm = mvtx_z_cm;
+      m_sigma_rphi_intt_cm = intt_rphi_cm;
+      m_sigma_r_intt_cm = intt_r_cm;
+      m_sigma_z_intt_cm = intt_z_cm;
+    }
+    // Pair-PCA search window along the native Si+TPC helix, anchored at the
+    // innermost measured point (upstream = towards / beyond the beam).
+    void set_sitpc_helix_search(const double max_upstream_cm, const double downstream_margin_cm)
+    {
+      m_sitpc_helix_max_upstream_cm = max_upstream_cm;
+      m_sitpc_helix_downstream_margin_cm = downstream_margin_cm;
+    }
+
+    // Displaced-vertex D0 / anti-D0 selection.  It is applied ON TOP of
+    // set_d0_selection / set_antid0_selection (mass window and prompt cuts),
+    // with the two-track secondary vertex (pair PCA).  Negative values disable a cut.
+    //   lxy_min / decay_length_min / decay_length_max : signed Lxy, 3-D flight [cm]
+    //   dira_min           : cos(flight, p_D0)
+    //   track_dca_xy_min   : |DCA_xy| of each daughter to the primary vertex [cm]
+    //   pair_dca_max       : daughter-daughter DCA [cm]
+    //   pointing_dca_xy_max: DCA_xy of the D0 line to the primary vertex [cm]
+    //   dca_product_max    : signed d0(K) * d0(pi) [cm^2], e.g. 0 keeps only
+    //                        opposite-sign impact parameters (> 1 disables)
+    void set_d0_displaced_selection(bool enabled,
+                                    double lxy_min,
+                                    double decay_length_min,
+                                    double decay_length_max,
+                                    double dira_min,
+                                    double track_dca_xy_min,
+                                    double pair_dca_max,
+                                    double pointing_dca_xy_max,
+                                    double dca_product_max = 2.0);
     void use_pattern_cluster_tracks(const bool value = true) { m_use_pattern_cluster_tracks = value; }
     void set_use_truth_primary_vertex(const bool value) { m_use_truth_primary_vertex = value; }
     void set_primary_vertex(const double x, const double y, const double z);
@@ -82,6 +209,7 @@ namespace tpchadronreco
       if (value)
       {
         m_fit_kalman_tracks = false;
+        m_fit_acts_tracks = false;
       }
     }
     void set_fit_kalman(const bool value)
@@ -93,6 +221,7 @@ namespace tpchadronreco
         m_use_final_track_helix = false;
       }
     }
+    // helix, kalman, acts, line, and (Si-associated tracks) sitpc / native.
     bool set_track_fit_method(const std::string &mode);
     void set_use_final_track_helix(const bool value) { m_use_final_track_helix = value; }
     bool set_point_order(const std::string &mode);
@@ -532,6 +661,31 @@ namespace tpchadronreco
       double primary_constraint_path_cm{0.0};
 
       unsigned int spatial_correction_points{0};
+
+      // ---- Si-associated track (SITPC_TRACKS)
+      bool has_si{false};
+      unsigned int sitpc_index{0};
+      int si_chain_id{-1};
+      unsigned int n_mvtx{0};
+      unsigned int n_intt{0};
+      unsigned int n_si_points{0};
+      int sitpc_fit_status{0};
+      double sitpc_dca{0.0};
+      double sitpc_z0{0.0};
+      double sitpc_circle_rms{0.0};
+      double sitpc_z_rms{0.0};
+      double sitpc_tpc_z_offset{0.0};
+      double sitpc_match_chi2{0.0};
+      unsigned char crossing_tier{255};
+      double si_vertex_z{0.0};
+      bool has_si_vertex_z{false};
+
+      // Collision (primary) vertex of this track: 0 fixed, 1 resolver Si z,
+      // 2 robust mean of the tracks of the collision.
+      bool has_collision_vertex{false};
+      Vec3 collision_vertex;
+      int collision_vertex_source{0};
+      unsigned int collision_vertex_ntracks{0};
     };
 
     struct LambdaCandidate
@@ -637,6 +791,34 @@ namespace tpchadronreco
       // Prompt-track PCA to the beam axis.
       double primary_pca_z_abs_max{-1.0};
       double primary_pca_dz_max{-1.0};
+    };
+
+    struct DisplacedCuts
+    {
+      bool enabled{false};
+      double lxy_min{-1.0};
+      double decay_length_min{-1.0};
+      double decay_length_max{-1.0};
+      double dira_min{-2.0};
+      double track_dca_xy_min{-1.0};
+      double pair_dca_max{-1.0};
+      double pointing_dca_xy_max{-1.0};
+      double dca_product_max{2.0};
+    };
+
+    // Displaced two-track quantities w.r.t. the primary vertex.
+    struct DisplacedPair
+    {
+      bool valid{false};
+      double lxy{0.0};
+      double lxy_signed{0.0};
+      double decay_length{0.0};
+      double dira{0.0};
+      double pointing_dca_xy{0.0};
+      double pointing_dca_3d{0.0};
+      double signed_dca_xy1{0.0};
+      double signed_dca_xy2{0.0};
+      double dca_product{0.0};
     };
 
     struct SigmaCuts
@@ -956,6 +1138,41 @@ namespace tpchadronreco
       unsigned int ntpc_clusters1{0};
       unsigned int ntpc_clusters2{0};
 
+      // ---- Si-associated tracks / collision vertex
+      int has_si1{0};
+      int has_si2{0};
+      unsigned int nmvtx1{0};
+      unsigned int nmvtx2{0};
+      unsigned int nintt1{0};
+      unsigned int nintt2{0};
+      int crossing_tier1{255};
+      int crossing_tier2{255};
+      float sitpc_tpc_z_offset1{0.0F};
+      float sitpc_tpc_z_offset2{0.0F};
+      float sitpc_circle_rms1{0.0F};
+      float sitpc_circle_rms2{0.0F};
+      float sitpc_z_rms1{0.0F};
+      float sitpc_z_rms2{0.0F};
+      float pv_x{0.0F};
+      float pv_y{0.0F};
+      float pv_z{0.0F};
+      int pv_source{0};
+      unsigned int pv_ntracks{0};
+
+      // ---- displaced two-track vertex (D0) w.r.t. the primary vertex
+      float signed_dca_xy1{0.0F};
+      float signed_dca_xy2{0.0F};
+      float dca_product{0.0F};
+      float lxy{0.0F};
+      float lxy_signed{0.0F};
+      float decay_length{0.0F};
+      float pointing_dca_xy{0.0F};
+      float pointing_dca_3d{0.0F};
+      float mass_D0_sv{0.0F};
+      float mass_AntiD0_sv{0.0F};
+      float mass_Phi_sv{0.0F};
+      int d0_displaced_mask{0};  // bit 0: D0, bit 1: anti-D0 passed the displaced selection
+
       int has_kshort_daughter_details{0};
       DaughterDetailRow daughter1;
       DaughterDetailRow daughter2;
@@ -965,6 +1182,22 @@ namespace tpchadronreco
     {
       int run{0};
       int evt{0};
+      int has_si{0};
+      unsigned int nmvtx{0};
+      unsigned int nintt{0};
+      int si_chain_id{-1};
+      int crossing_tier{255};
+      float sitpc_dca{0.0F};
+      float sitpc_circle_rms{0.0F};
+      float sitpc_z_rms{0.0F};
+      float sitpc_tpc_z_offset{0.0F};
+      float sitpc_match_chi2{0.0F};
+      float si_vertex_z{0.0F};
+      float pv_x{0.0F};
+      float pv_y{0.0F};
+      float pv_z{0.0F};
+      int pv_source{0};
+      unsigned int pv_ntracks{0};
       int track_id{0};
       unsigned int source_assembled_track_id{0};
       int crossing_valid{0};
@@ -1140,6 +1373,29 @@ namespace tpchadronreco
                                                     Tpc_PolyTrackContainer *tracks,
                                                     const TpcCrossingDecisionContainer *crossing_decisions) const;
     bool finalize_pattern_tracklet(Tracklet &tracklet, bool has_upstream_state) const;
+    std::map<int, Tracklet> build_sitpc_tracklets(const SiTpc_TrackContainer *sitpc_tracks,
+                                                  Tpc_PolyTrackContainer *tpc_tracks,
+                                                  const TpcCrossingDecisionContainer *crossing_decisions) const;
+    bool finalize_sitpc_native_helix(Tracklet &tracklet) const;
+    void assign_sitpc_collision_vertices(std::map<int, Tracklet> &tracklets) const;
+    Vec3 beam_at_z(double z) const;
+    const Vec3 &tracklet_primary_vertex(const Tracklet &tracklet, const Vec3 &fallback) const;
+    Vec3 pair_primary_vertex(const Tracklet &track1, const Tracklet &track2,
+                             const Vec3 &fallback) const;
+    DisplacedPair displaced_pair(const Vec3 &pair_vertex,
+                                 const Vec3 &total_momentum,
+                                 const Vec3 &primary_vertex,
+                                 const Vec3 &primary_pca1, const Vec3 &primary_mom1,
+                                 const Vec3 &primary_pca2, const Vec3 &primary_mom2,
+                                 bool have_primary_pair) const;
+    bool passes_d0_displaced_selection(const DisplacedPair &displaced,
+                                       const std::pair<double, double> &dca1,
+                                       const std::pair<double, double> &dca2,
+                                       double pair_dca) const;
+    void run_pair_stage(const std::vector<const Tracklet *> &tracklets,
+                        const Vec3 &primary_vertex,
+                        int run_number, int event_number,
+                        std::uint64_t &pairs_processed);
     bool make_pair_row(const Tracklet &track1, const Tracklet &track2,
                        const Vec3 &primary_vertex, const int run_number,
                        const int event_number,
@@ -1354,6 +1610,55 @@ namespace tpchadronreco
     std::string m_tpc_crossing_decision_node{"TPC_CROSSING_DECISIONS"};
     bool m_use_pattern_cluster_tracks{false};
 
+    // ---- Si-associated tracks
+    enum class SiTpcVertexMode
+    {
+      Resolver,
+      Tracks,
+      Fixed
+    };
+    bool m_use_sitpc_tracks{false};
+    std::string m_sitpc_track_node{"SITPC_TRACKS"};
+    bool m_use_sitpc_native_helix{false};
+    bool m_sitpc_add_unmatched_tpc_tracks{false};
+    unsigned int m_sitpc_min_mvtx{2};
+    unsigned int m_sitpc_min_intt{0};
+    unsigned int m_sitpc_min_si_points{2};
+    unsigned int m_sitpc_min_tpc_points{10};
+    double m_sitpc_max_circle_rms_cm{-1.0};
+    double m_sitpc_max_z_rms_cm{-1.0};
+    int m_sitpc_max_crossing_tier{1};
+    bool m_sitpc_require_crossing_decision{true};
+    bool m_sitpc_require_timed_collision{false};
+    bool m_sitpc_apply_tpc_z_offset{true};
+    SiTpcVertexMode m_sitpc_vertex_mode{SiTpcVertexMode::Resolver};
+    double m_sitpc_vertex_track_dca_xy_max_cm{0.1};
+    double m_sitpc_vertex_track_z_window_cm{0.5};
+    unsigned int m_sitpc_vertex_min_tracks{2};
+    double m_sitpc_beam_x0_cm{0.0};
+    double m_sitpc_beam_y0_cm{0.0};
+    double m_sitpc_beam_dxdz{0.0};
+    double m_sitpc_beam_dydz{0.0};
+    double m_sitpc_helix_max_upstream_cm{10.0};
+    double m_sitpc_helix_downstream_margin_cm{5.0};
+    // MVTX: ~27 x 29 um pixels + residual misalignment; INTT: 78 um pitch,
+    // 1.6 / 2.0 cm strips (z sigma = strip length / sqrt(12)).
+    double m_sigma_rphi_mvtx_cm{0.0010};
+    double m_sigma_r_mvtx_cm{0.0010};
+    double m_sigma_z_mvtx_cm{0.0010};
+    double m_sigma_rphi_intt_cm{0.0030};
+    double m_sigma_r_intt_cm{0.0030};
+    double m_sigma_z_intt_cm{0.50};
+    DisplacedCuts m_d0_displaced_cuts;
+    mutable std::uint64_t m_counter_sitpc_seen{0};
+    mutable std::uint64_t m_counter_sitpc_reject_quality{0};
+    mutable std::uint64_t m_counter_sitpc_reject_crossing{0};
+    mutable std::uint64_t m_counter_sitpc_reject_fit{0};
+    mutable std::uint64_t m_counter_sitpc_accepted{0};
+    mutable std::uint64_t m_counter_sitpc_vertex_resolver{0};
+    mutable std::uint64_t m_counter_sitpc_vertex_tracks{0};
+    mutable std::uint64_t m_counter_sitpc_vertex_fixed{0};
+
     bool m_apply_spatial_correction{false};
     bool m_apply_spatial_correction_z{false};
     double m_spatial_correction_scale{1.0};
@@ -1381,6 +1686,10 @@ namespace tpchadronreco
     int m_min_points{5};
     bool m_fit_helix_tracks{true};
     bool m_fit_kalman_tracks{false};
+    // With m_fit_acts_tracks the Kalman path is kept, but the per-track fit is
+    // done by TpcTrackActsFitter (needs the ActsGeometry node).
+    bool m_fit_acts_tracks{false};
+    std::unique_ptr<TpcTrackActsFitter> m_acts_fitter;
     bool m_use_final_track_helix{false};
     PointOrder m_point_order{PointOrder::Path};
     int m_fit_first_points{8};

@@ -2,6 +2,10 @@
 #define MACRO_FUN4ALLTPCV0CANDIDATETREE_C
 
 R__LOAD_LIBRARY(libfun4all.so)
+// tpctrackreco / sitrackreco: dictionaries of the DST nodes read in Si+TPC mode
+// (TPC_POLYTRACKS, TPC_CROSSING_DECISIONS, SITPC_TRACKS).
+R__LOAD_LIBRARY(libtpctrackreco.so)
+R__LOAD_LIBRARY(libsitrackreco.so)
 R__LOAD_LIBRARY(libTpcHadronReco.so)
 
 #include <tpchadronreco/TpcV0CandidateTree.h>
@@ -79,7 +83,19 @@ int Fun4All_TpcV0CandidateTree(
   auto *v0 = new tpchadronreco::TpcV0CandidateTree("TpcV0CandidateTree", output_file);
   v0->Verbosity(env_int("V0_MODULE_VERBOSITY", 0));
 
+  // Track source: "tpc"       TPC-only poly tracks (previous behaviour)
+  //               "sitpc"     Si-associated tracks (SITPC_TRACKS of SiTpcTrackMatcher)
+  //               "sitpc+tpc" Si-associated tracks + the TPC tracks without Si match
+  const std::string track_source = env_string("V0_TRACK_SOURCE", "tpc");
+  const bool use_sitpc = track_source == "sitpc" || track_source == "sitpc+tpc";
+  if (!use_sitpc && track_source != "tpc")
+  {
+    std::cerr << "Unknown V0_TRACK_SOURCE='" << track_source << "'" << std::endl;
+    return 2;
+  }
   v0->use_pattern_cluster_tracks(env_bool("V0_USE_PATTERN_TRACKS", true));
+  v0->use_sitpc_tracks(use_sitpc);
+  v0->set_sitpc_add_unmatched_tpc_tracks(track_source == "sitpc+tpc");
   v0->set_tpc_sa_cluster_node(env_string("V0_CLUSTER_NODE", "TPC_POLYCLUSTERS"));
   v0->set_tpc_sa_track_node(env_string("V0_TRACK_NODE", "TPC_POLYTRACKS"));
   v0->set_tpc_sa_track_vertex_node(env_string("V0_VERTEX_NODE", "TPC_POLYTRACKVERTICES"));
@@ -151,8 +167,10 @@ int Fun4All_TpcV0CandidateTree(
   // Track fit: "acts" = ACTS Kalman fit on per-cluster cylinder surfaces with
   // the sPHENIX field map (needs the ACTS geometry, set up below).
   // The custom Kalman/RKN fit is still available with V0_FIT_MODE=kalman.
+  // Si+TPC tracks: "sitpc" = combined Si+TPC helix as fitted by SiTpcTrackMatcher
+  // (default), "kalman" = Kalman/RKN refit of the Si + TPC points; "acts" is TPC-only.
   //const std::string fit_mode = env_string("V0_FIT_MODE", "kalman");
-  const std::string fit_mode = env_string("V0_FIT_MODE", "acts");
+  const std::string fit_mode = env_string("V0_FIT_MODE", use_sitpc ? "sitpc" : "acts");
   if (!v0->set_track_fit_method(fit_mode))
   {
     std::cerr << "Unknown V0_FIT_MODE='" << fit_mode << "'" << std::endl;
@@ -161,7 +179,7 @@ int Fun4All_TpcV0CandidateTree(
   //v0->set_use_final_track_helix(true);
 
   v0->set_point_order(env_string("V0_POINT_ORDER", "radius-descending"));
-  v0->set_min_points(env_int("V0_MIN_POINTS", 30));
+  v0->set_min_points(env_int("V0_MIN_POINTS", use_sitpc ? 20 : 30));
   v0->set_fit_first_points(env_int("V0_FIT_FIRST_POINTS", 8));
   v0->set_bfield(env_double("V0_BFIELD_T", 1.4));
 
@@ -242,7 +260,7 @@ int Fun4All_TpcV0CandidateTree(
   v0->set_pre_lproj_min(env_double("V0_PRE_LPROJ_MIN", -1.0));
   v0->set_pre_cos_theta_min(env_double("V0_PRE_COSTHETA_MIN", -2.0));
   v0->set_pre_track_quality_max(env_double("V0_PRE_TRACK_QUALITY_MAX", -1.0));
-  v0->set_pre_track_npoints_min(env_int("V0_PRE_TRACK_NPOINTS_MIN", 20));
+  v0->set_pre_track_npoints_min(env_int("V0_PRE_TRACK_NPOINTS_MIN", use_sitpc ? 12 : 20));
 
   // K0S -> pi+ pi-. These defaults reproduce the cuts you specified.
   v0->set_kshort_selection(
@@ -352,18 +370,19 @@ int Fun4All_TpcV0CandidateTree(
 
   // Prompt phi -> K+K-. Keep reconstruction cuts loose; the QA macro scans
   // the strongest same-collision variable |primary_pca1_z-primary_pca2_z|.
+  // Si+TPC defaults: DCAs to the collision vertex (Si z), ~100 um-level tracks.
   v0->set_phi_selection(
     env_bool("V0_ENABLE_PHI", true),
-    env_int("V0_PHI_MIN_TPC_CLUSTERS", 30),
+    env_int("V0_PHI_MIN_TPC_CLUSTERS", use_sitpc ? 10 : 30),
     env_double("V0_PHI_TRACK_PT_MIN", 0.20),
     env_double("V0_PHI_MASS_MIN", 0.98),
     env_double("V0_PHI_MASS_MAX", 1.08),
-    env_double("V0_PHI_TRACK_DCA_XY_MAX", 3.0),
-    env_double("V0_PHI_TRACK_DCA_Z_MAX", -1.0),
+    env_double("V0_PHI_TRACK_DCA_XY_MAX", use_sitpc ? 0.1 : 3.0),
+    env_double("V0_PHI_TRACK_DCA_Z_MAX", use_sitpc ? 0.2 : -1.0),
     env_double("V0_PHI_PAIR_DCA_MAX", -1.0),
     env_double("V0_PHI_FLIGHT_LENGTH_MAX", -1.0),
     env_double("V0_PHI_PRIMARY_PCA_Z_MAX", 20.0),
-    env_double("V0_PHI_PRIMARY_PCA_DZ_MAX", 2.0)
+    env_double("V0_PHI_PRIMARY_PCA_DZ_MAX", use_sitpc ? 0.2 : 2.0)
   );
 
   // Prompt J/psi -> e+e-. Electron identification is not applied here;
@@ -385,30 +404,30 @@ int Fun4All_TpcV0CandidateTree(
   // Prompt D0 -> K- pi+ and anti-D0 -> K+ pi-.
   v0->set_d0_selection(
     env_bool("V0_ENABLE_D0", true),
-    env_int("V0_D0_MIN_TPC_CLUSTERS", 30),
+    env_int("V0_D0_MIN_TPC_CLUSTERS", use_sitpc ? 10 : 30),
     env_double("V0_D0_TRACK_PT_MIN", 0.20),
     env_double("V0_D0_MASS_MIN", 1.70),
     env_double("V0_D0_MASS_MAX", 2.05),
-    env_double("V0_D0_TRACK_DCA_XY_MAX", 3.0),
-    env_double("V0_D0_TRACK_DCA_Z_MAX", -1.0),
+    env_double("V0_D0_TRACK_DCA_XY_MAX", use_sitpc ? 0.5 : 3.0),
+    env_double("V0_D0_TRACK_DCA_Z_MAX", use_sitpc ? 0.3 : -1.0),
     env_double("V0_D0_PAIR_DCA_MAX", -1.0),
     env_double("V0_D0_FLIGHT_LENGTH_MAX", -1.0),
     env_double("V0_D0_PRIMARY_PCA_Z_MAX", 20.0),
-    env_double("V0_D0_PRIMARY_PCA_DZ_MAX", 2.0)
+    env_double("V0_D0_PRIMARY_PCA_DZ_MAX", use_sitpc ? 0.3 : 2.0)
 );
 
   v0->set_antid0_selection(
     env_bool("V0_ENABLE_ANTID0", true),
-    env_int("V0_ANTID0_MIN_TPC_CLUSTERS", 30),
+    env_int("V0_ANTID0_MIN_TPC_CLUSTERS", use_sitpc ? 10 : 30),
     env_double("V0_ANTID0_TRACK_PT_MIN", 0.20),
     env_double("V0_ANTID0_MASS_MIN", 1.70),
     env_double("V0_ANTID0_MASS_MAX", 2.05),
-    env_double("V0_ANTID0_TRACK_DCA_XY_MAX", 3.0),
-    env_double("V0_ANTID0_TRACK_DCA_Z_MAX", -1.0),
+    env_double("V0_ANTID0_TRACK_DCA_XY_MAX", use_sitpc ? 0.5 : 3.0),
+    env_double("V0_ANTID0_TRACK_DCA_Z_MAX", use_sitpc ? 0.3 : -1.0),
     env_double("V0_ANTID0_PAIR_DCA_MAX", -1.0),
     env_double("V0_ANTID0_FLIGHT_LENGTH_MAX", -1.0),
     env_double("V0_ANTID0_PRIMARY_PCA_Z_MAX", 20.0),
-    env_double("V0_ANTID0_PRIMARY_PCA_DZ_MAX", 2.0));
+    env_double("V0_ANTID0_PRIMARY_PCA_DZ_MAX", use_sitpc ? 0.3 : 2.0));
 
   // Like-sign backgrounds are written to a separate tree with exactly the
   // same branch layout as pairTree.  V0_WRITE_SAME_SIGN remains a legacy K0S
@@ -434,6 +453,61 @@ int Fun4All_TpcV0CandidateTree(
   v0->set_tpc_crossing_decision_node(
       env_string("V0_CROSSING_NODE", "TPC_CROSSING_DECISIONS"));
   v0->set_require_same_crossing(env_bool("V0_REQUIRE_SAME_CROSSING", true));
+
+  // ---- Si-associated tracks (V0_TRACK_SOURCE=sitpc / sitpc+tpc)
+  if (use_sitpc)
+  {
+    v0->set_sitpc_track_node(env_string("V0_SITPC_NODE", "SITPC_TRACKS"));
+    v0->set_sitpc_track_selection(
+        env_int("V0_SITPC_MIN_MVTX", 2),
+        env_int("V0_SITPC_MIN_INTT", 0),
+        env_int("V0_SITPC_MIN_SI", 2),
+        env_int("V0_SITPC_MIN_TPC", 10),
+        env_double("V0_SITPC_MAX_CIRCLE_RMS", -1.0),
+        env_double("V0_SITPC_MAX_Z_RMS", -1.0));
+    v0->set_sitpc_max_crossing_tier(env_int("V0_SITPC_MAX_TIER", 1));
+    v0->set_sitpc_require_crossing_decision(env_bool("V0_SITPC_REQUIRE_DECISION", true));
+    v0->set_sitpc_require_timed_collision(env_bool("V0_SITPC_REQUIRE_TIMED", false));
+    v0->set_sitpc_apply_tpc_z_offset(env_bool("V0_SITPC_APPLY_TPC_Z_OFFSET", true));
+    if (!v0->set_sitpc_vertex_mode(env_string("V0_SITPC_VERTEX_MODE", "resolver")))
+    {
+      return 2;
+    }
+    v0->set_sitpc_vertex_track_selection(
+        env_double("V0_SITPC_VERTEX_TRACK_DCA_MAX", 0.1),
+        env_double("V0_SITPC_VERTEX_Z_WINDOW", 0.5),
+        env_int("V0_SITPC_VERTEX_MIN_TRACKS", 2));
+    // Beam in the TPC frame of SiTpcBeamAlignment (setCenterBeam(true) -> (0, 0)).
+    v0->set_sitpc_beam_line(
+        env_double("V0_SITPC_BEAM_X", 0.0),
+        env_double("V0_SITPC_BEAM_Y", 0.0),
+        env_double("V0_SITPC_BEAM_DXDZ", 0.0),
+        env_double("V0_SITPC_BEAM_DYDZ", 0.0));
+    v0->set_si_measurement_sigmas(
+        env_double("V0_MVTX_SIGMA_RPHI", 0.0010),
+        env_double("V0_MVTX_SIGMA_R", 0.0010),
+        env_double("V0_MVTX_SIGMA_Z", 0.0010),
+        env_double("V0_INTT_SIGMA_RPHI", 0.0030),
+        env_double("V0_INTT_SIGMA_R", 0.0030),
+        env_double("V0_INTT_SIGMA_Z", 0.50));
+    v0->set_sitpc_helix_search(
+        env_double("V0_SITPC_HELIX_MAX_UPSTREAM_CM", 10.0),
+        env_double("V0_SITPC_HELIX_DOWNSTREAM_CM", 5.0));
+    // With the collision vertex known, the fixed beam spot is only the fallback.
+    v0->set_primary_vertex(0.0, 0.0, 0.0);
+  }
+
+  // Displaced-vertex D0 cuts on top of the D0 selection above (Si+TPC tracks).
+  v0->set_d0_displaced_selection(
+      env_bool("V0_D0_DISPLACED", false),
+      env_double("V0_D0_LXY_MIN", 0.0),
+      env_double("V0_D0_DECAY_LENGTH_MIN", -1.0),
+      env_double("V0_D0_DECAY_LENGTH_MAX", 0.5),
+      env_double("V0_D0_DIRA_MIN", 0.90),
+      env_double("V0_D0_TRACK_DCA_XY_MIN", 0.005),
+      env_double("V0_D0_SV_PAIR_DCA_MAX", 0.03),
+      env_double("V0_D0_POINTING_DCA_XY_MAX", 0.01),
+      env_double("V0_D0_DCA_PRODUCT_MAX", 2.0));
   
   
   // Full daughter cluster payload remains K0S-only. TrackTree is independent
@@ -473,9 +547,12 @@ int Fun4All_TpcV0CandidateTree(
             << " xi=" << (env_bool("V0_ENABLE_XI", false) ? 1 : 0)
             << " omega=" << (env_bool("V0_ENABLE_OMEGA", false) ? 1 : 0)
             << " trackTree=" << (env_bool("V0_WRITE_TRACK_TREE", false) ? 1 : 0)
+            << " track_source=" << track_source
+            << " fit=" << fit_mode
+            << " d0_displaced=" << (env_bool("V0_D0_DISPLACED", false) ? 1 : 0)
             << std::endl;
 
-  if (fit_mode == "acts")
+  if (fit_mode == "acts" && !use_sitpc)
   {
     // ActsGeometry (and its magnetic field, FIELDMAP_TRACKING from the CDB)
     // must exist before TpcV0CandidateTree::InitRun.
