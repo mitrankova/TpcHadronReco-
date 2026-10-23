@@ -95,4 +95,6 @@ TrackingProduction/*.txt
 TpcProduction/log/*
 TpcProduction/*.txt
 *.png
+*.pdf
+build/
 TpcProduction/Fun4All_raw_hit_TPC_reco_Work.C

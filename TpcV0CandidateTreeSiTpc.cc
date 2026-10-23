@@ -157,18 +157,21 @@ namespace tpchadronreco
       return tracklets;
     }
 
-    std::map<unsigned int, const TpcCrossingDecision *> crossing_by_source_id;
-    if (crossing_decisions)
+    // TpcCrossingDecisionContainer::get_decision() takes the ASSEMBLED TRACK ID
+    // (the container is a map keyed by it), not an index.
+    const auto find_decision = [crossing_decisions](const unsigned int assembled_track_id)
+        -> const TpcCrossingDecision *
     {
-      for (unsigned int idecision = 0; idecision < crossing_decisions->size(); ++idecision)
+      if (!crossing_decisions)
       {
-        const auto *decision = crossing_decisions->get_decision(idecision);
-        if (decision && decision->isValid())
-        {
-          crossing_by_source_id[decision->get_assembled_track_id()] = decision;
-        }
+        return nullptr;
       }
-    }
+      const TpcCrossingDecision *decision = crossing_decisions->get_decision(assembled_track_id);
+      return (decision && decision->isValid() &&
+              decision->get_assembled_track_id() == assembled_track_id)
+                 ? decision
+                 : nullptr;
+    };
 
     // TPC poly tracks by id (dE/dx and cluster count); the stored index is tried first.
     std::map<unsigned int, const Tpc_PolyTrack *> tpc_by_id;
@@ -247,9 +250,7 @@ namespace tpchadronreco
 
       // ---- resolved crossing
       const unsigned int source_id = track->get_tpc_assembled_track_id();
-      const auto crossing_iter = crossing_by_source_id.find(source_id);
-      const TpcCrossingDecision *decision =
-          crossing_iter != crossing_by_source_id.end() ? crossing_iter->second : nullptr;
+      const TpcCrossingDecision *decision = find_decision(source_id);
       if (!decision && m_sitpc_require_crossing_decision)
       {
         ++m_counter_sitpc_reject_crossing;

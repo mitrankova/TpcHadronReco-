@@ -1,0 +1,13 @@
+Universe           = vanilla
+Initialdir         = /sphenix/user/mitrankova/TpcHadronReco/work
+Executable         = $(Initialdir)/run_reco.sh
+#Output            = /sphenix/user/mitrankova/TpcHadronReco/work/log/pp_TpcReco_$(process).out
+#Error             = /sphenix/user/mitrankova/TpcHadronReco/work/log/pp_TpcReco_$(process).err
+Log                = /tmp/poly_pp_TpcReco_$(process).log
+PeriodicHold       = (NumJobStarts>=1 && JobStatus == 1)
+request_memory     = 8GB
+request_cpus       = 3
+Priority           = 20
+job_lease_duration = 3600
+Arguments          = 2000 $(process) 0
+Queue 3890

@@ -1521,18 +1521,21 @@ namespace tpchadronreco
       clusters_by_source_id[cluster->get_source_assembled_track_id()].push_back(cluster);
     }
 
-    std::map<unsigned int, const TpcCrossingDecision *> crossing_by_source_id;
-    if (crossing_decisions)
+    // TpcCrossingDecisionContainer::get_decision() takes the ASSEMBLED TRACK ID
+    // (the container is a map keyed by it), not an index.
+    const auto find_decision = [crossing_decisions](const unsigned int assembled_track_id)
+        -> const TpcCrossingDecision *
     {
-      for (unsigned int idecision = 0; idecision < crossing_decisions->size(); ++idecision)
+      if (!crossing_decisions)
       {
-        const auto *decision = crossing_decisions->get_decision(idecision);
-        if (decision && decision->isValid())
-        {
-          crossing_by_source_id[decision->get_assembled_track_id()] = decision;
-        }
+        return nullptr;
       }
-    }
+      const TpcCrossingDecision *decision = crossing_decisions->get_decision(assembled_track_id);
+      return (decision && decision->isValid() &&
+              decision->get_assembled_track_id() == assembled_track_id)
+                 ? decision
+                 : nullptr;
+    };
 
     for (unsigned int itrack = 0; itrack < tracks->size(); ++itrack)
     {
@@ -1554,12 +1557,11 @@ namespace tpchadronreco
       Tracklet tracklet;
       tracklet.track_id = track_id;
       tracklet.source_assembled_track_id = source_id;
-      const auto crossing_iter = crossing_by_source_id.find(source_id);
-      if (crossing_iter != crossing_by_source_id.end())
+      if (const TpcCrossingDecision *decision = find_decision(source_id))
       {
         tracklet.crossing_valid = true;
-        tracklet.crossing = crossing_iter->second->get_selected_crossing();
-        tracklet.crossing_status = crossing_iter->second->get_status();
+        tracklet.crossing = decision->get_selected_crossing();
+        tracklet.crossing_status = decision->get_status();
       }
       tracklet.shower_id = static_cast<int>(source_id);
       tracklet.charge = sign_to_charge(track->get_charge());
@@ -1819,6 +1821,13 @@ namespace tpchadronreco
       {
         *momentum_at_pca = helix_momentum(tracklet.helix, theta);
       }
+      if (path_at_pca_cm)
+      {
+        // signed transverse path from theta_first along the direction of motion
+        // (make_pair_row needs it finite for the prompt phi / D0 / J/psi kinematics)
+        *path_at_pca_cm = tracklet.helix.direction * (theta - tracklet.helix.theta_first) *
+                          tracklet.helix.radius;
+      }
       signed_dca_xy = center_distance - tracklet.helix.radius;
       return finite(pca) && std::isfinite(signed_dca_xy);
     }
@@ -1836,6 +1845,10 @@ namespace tpchadronreco
     if (momentum_at_pca)
     {
       *momentum_at_pca = tracklet.momentum;
+    }
+    if (path_at_pca_cm)
+    {
+      *path_at_pca_cm = scale_to_pca * norm(tracklet.momentum);
     }
     signed_dca_xy = (relative.x * tracklet.momentum.y -
                      relative.y * tracklet.momentum.x) /
@@ -2532,9 +2545,26 @@ namespace tpchadronreco
       }
       if (candidates.empty())
       {
-        ++m_counter_reject_pca;
-        return false;
+        // As in the Kalman path: no daughter-daughter PCA, but prompt
+        // phi / D0 / J/psi candidates only need the two beam-axis PCAs.
+        // Secondary species stay disabled (have_secondary_pca = false).
+        if (!have_primary_pair)
+        {
+          ++m_counter_reject_pca;
+          return false;
+        }
+        pca1 = primary_pca1;
+        pca2 = primary_pca2;
+        pair_dca = nan;
+        theta1 = nan;
+        theta2 = nan;
+        mom1 = primary_mom1;
+        mom2 = primary_mom2;
+        dca1 = helix_dca_to_vertex(track1.helix, primary_vertex);
+        dca2 = helix_dca_to_vertex(track2.helix, primary_vertex);
       }
+      else
+      {
       have_secondary_pca = true;
 
       auto best = candidates.front();
@@ -2568,6 +2598,7 @@ namespace tpchadronreco
       mom2 = helix_momentum(track2.helix, theta2);
       dca1 = helix_dca_to_vertex(track1.helix, primary_vertex);
       dca2 = helix_dca_to_vertex(track2.helix, primary_vertex);
+      }
     }
     else
     {

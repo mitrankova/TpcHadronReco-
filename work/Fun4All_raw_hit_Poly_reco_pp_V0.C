@@ -132,14 +132,14 @@ class TpcAssembledTrackCountCut : public SubsysReco
 //.x Fun4All_raw_hit_TPC_reco.C(2, 82626, 0, ".", 0, "run3oo", "ana537_nocdbtag_v001","HITS_OO")
 
 void Fun4All_raw_hit_Poly_reco_pp_V0(
-    const int nEvents = 10,
+    const int nEvents = 500,
     const int runnumber = 79513,
     const int segment = 0,
     const std::string& outdir = ".",
     const int nSkip = 0,
     const std::string& collision = "run3pp",
     const std::string& production = "ana561_2025p013_v001",
-    const std::string& outfilename = "ppFieldOn_Test_3pts_resolv_si_align2",
+    const std::string& outfilename = "ppFieldOn_New_si_align_si_fit",
     const std::string& datatype = "physics",
     const bool runHadronReco = true,   // phi / D0 / K0S / Lambda from the Si+TPC tracks (this job)
     const bool writeDst = false)       // DST with the Si+TPC nodes for a later TpcHadronReco pass
@@ -378,78 +378,100 @@ if(collision!="run3line_laser"&&collision!="run3cosmics")
   }
 
   //------------------------------------------------------------
+  // ---- Si frame
+  // The silicon is placed by the official tracking geometry (setUseActsGeometry) incl. the MVTX global
+  // displacement D, then shifted so that its beam spot is at (0, 0) (correctSiBeamSpot below).
+  // Convention (sPHENIX coresoftware):
+  //   MakeActsGeometry::makeMvtxMapPairs: MVTX surfaces of the ACTS geometry sit at nominal + D,
+  //     D = MVTX_ALIGNMENT global displacement = (6.2955, -1.06874, -6.66289) mm (log line
+  //     "Global displacement"), the INTT gets NO displacement;
+  //   PHActsSiliconSeeding: m_mvtx_x0, m_mvtx_y0 = (+0.6, -0.1) cm = MVTX layer circles centre
+  //     in the global frame, INTT circles centred at (0, 0);
+  //   TRACKINGALIGNMENT translations are small corrections on top of that geometry.
+  // So: global = detector + D for the MVTX (SiDetectorFrame::toGlobal adds the centre: sign OK),
+  // and global = detector for the INTT.  SiDetectorFrame now has a separate INTT centre
+  // (setInttCenterMm), so the OFFICIAL si_align_params.txt is used unchanged:
+  //   MVTX centre = D (x, y), INTT centre = (0, 0, 0).
+  // check_si_alignment.py si_align_params.txt: MVTX and INTT means both small -> this setup.
+  const double siDispXmm = 6.2955, siDispYmm = -1.06874, siDispZmm = -6.66289;  // D [mm]
+
+  // ---- Si beam spot correction: the WHOLE silicon (MVTX + INTT, both halves together) is shifted in
+  // x, y so that its beam is at (0, 0).  The TPC is NOT moved (TPC beam line 0: tpcToTpcFrame is the
+  // identity, the TPC points stay in the raw TPC frame).
+  //   Si output = Si global - (x0, y0)     (SiTpcBeamAlignment::siHalfToTpcAxis, SiFull, x, y only)
+  // (x0, y0) = beam spot of the Si-only vertices, measured with EXACTLY this silicon setup (official
+  // ActsGeometry positions, z shift +D_z, MVTX centre D, INTT survey centre) and the correction OFF:
+  //   plot_vertices.C, Si only: x0 = -0.07411 +- 0.00079 cm, y0 = +0.15380 +- 0.00074 cm
+  //   (Si+TPC: -0.07236, +0.14684).  The slopes are stored but not applied (no tilt correction).
+  // To iterate: run with the correction ON and ADD the new Si-only x0, y0 to the values below.
+  // Re-measure if the silicon geometry / alignment changes.
+  const bool correctSiBeamSpot = true;
+  const double siBeamX0cm = -0.074114, siBeamY0cm = 0.153802;
+  const double siBeamDxDz = -8.932876e-04, siBeamDyDz = 9.177683e-05;  // metadata only
+  // centerTpcBeamToo = true (V0 job): the TPC points are shifted by the TPC-only beam spot as well (a
+  // frame shift, not a TPC alignment change), so BOTH beams are at (0, 0).  Needed here because the
+  // SITPC_TRACKS circle comes from the TPC points (matcher xy weights) and TpcV0CandidateTree computes
+  // DCA_xy to set_sitpc_beam_line(0, 0): with the TPC not centred, every track would carry the TPC beam
+  // offset (-0.11, +0.23) cm in its DCA.  false: TPC in the raw TPC frame (as in the reco test macro).
+  const bool centerTpcBeamToo = true;
+
   SiTpcBeamAlignment beamAlign;
-  beamAlign.setEnabled(true);
-  beamAlign.setCenterBeam(true);  
-  beamAlign.setClamshellBoundary(0.0);  // halves: A = Uphi in [0, pi)
-  beamAlign.setSiPerHalf(true);   
- /*
-  beamAlign.setBeamLineCm(SiTpcBeamAlignment::Tpc, -0.106835, 0.267482, 0.0, 0.0);
-  beamAlign.setBeamLineMm( SiTpcBeamAlignment::SiHalfA,-0.533300, 1.772693,0.0, 0.0);
-  beamAlign.setBeamLineMm(SiTpcBeamAlignment::SiHalfB,0.595174, 1.608226, 0.0, 0.0);
+  beamAlign.setEnabled(correctSiBeamSpot);  // false: TPC and Si points are used as they are
+  beamAlign.setCenterBeam(true);            // every part moved by its own beam line
+  beamAlign.setSiPerHalf(false);            // one offset for the whole silicon (SiFull)
+  beamAlign.setBeamLineCm(SiTpcBeamAlignment::SiFull, siBeamX0cm, siBeamY0cm, siBeamDxDz, siBeamDyDz);
+  if (centerTpcBeamToo)
+  {
+    beamAlign.setBeamLineCm(SiTpcBeamAlignment::Tpc, -0.110619, 0.232978, 6.262366e-04, -8.980053e-04);  // TPC-only vertices
+  }
+  else
+  {
+    beamAlign.setBeamLineCm(SiTpcBeamAlignment::Tpc, 0.0, 0.0, 0.0, 0.0);  // TPC unchanged
+  }
+  beamAlign.print();
 
-  //                       part                           x0         y0         dx/dz          dy/dz
-  beamAlign.setBeamLineCm(SiTpcBeamAlignment::Tpc,     -0.106835,  0.267482,  8.478616e-04, -8.041254e-04);  // [cm]
-  beamAlign.setBeamLineMm(SiTpcBeamAlignment::SiHalfA, -0.533300,  1.772693,  7.094553e-04, -2.743455e-04);  // [mm]
-  beamAlign.setBeamLineMm(SiTpcBeamAlignment::SiHalfB,  0.595174,  1.608226,  2.343532e-03,  6.926381e-04);  // [mm]
-  const double siUphiRotation = 0.1481;                // global phi = Uphi + 0.1481 rad
-  const double siCenterXmm = 6.0, siCenterYmm = -1.0;  // Si detector shift (detector -> global frame)
- */
-
-beamAlign.setBeamLineCm(SiTpcBeamAlignment::Tpc, -0.106835, 0.267482, 8.478616e-04, -8.041254e-04);
- 
-// Si: the measured fits are UNALIGNED, global frame with centre (+6, -1, 0) mm.
-// PROVISIONAL bridge to this configuration (REPLACE with fits from a run with exactly these
-// settings):
-//   1. alignment file ON  -> beam moves by +t (mean MVTX sensor translation of that half)
-//        half A (upper): t = (-0.185, -0.207) mm   half B (lower): t = (-0.248, -0.035) mm
-//        whole MVTX    : t = (-0.216, -0.121) mm
-//   2. centre (6, -1) -> D -> beam moves by D - (6, -1) = (+0.2955, -0.06874) mm
-const double siDispXmm = 6.2955, siDispYmm = -1.06874, siDispZmm = -6.66289;
-const double dCx = siDispXmm - 6.0, dCy = siDispYmm - (-1.0);
- 
-beamAlign.setBeamLineMm(SiTpcBeamAlignment::SiHalfA, -0.533300, 1.772693, 7.094553e-04, -2.743455e-04);
-beamAlign.shiftBeamLineMm(SiTpcBeamAlignment::SiHalfA, -0.185, -0.207);   // alignment file
-beamAlign.shiftBeamLineMm(SiTpcBeamAlignment::SiHalfA, dCx, dCy);         // -> (-0.423, 1.497)
- 
-beamAlign.setBeamLineMm(SiTpcBeamAlignment::SiHalfB, 0.595174, 1.608226, 2.343532e-03, 6.926381e-04);
-beamAlign.shiftBeamLineMm(SiTpcBeamAlignment::SiHalfB, -0.248, -0.035);   // alignment file
-beamAlign.shiftBeamLineMm(SiTpcBeamAlignment::SiHalfB, dCx, dCy);         // -> ( 0.643, 1.505)
- 
-// whole Si (used only with setSiPerHalf(false)): mean of the two halves + whole-MVTX t
-beamAlign.setBeamLineMm(SiTpcBeamAlignment::SiFull, 0.030937, 1.690460, 0.0, 0.0);
-beamAlign.shiftBeamLineMm(SiTpcBeamAlignment::SiFull, -0.216, -0.121);    // alignment file
-beamAlign.shiftBeamLineMm(SiTpcBeamAlignment::SiFull, dCx, dCy);          // -> ( 0.110, 1.501)
- 
-beamAlign.print();        
-// Silicon intrinsic -> ideal detector frame.
-const double siUphiRotation = 0.1481;
-
-// Ideal detector -> current silicon global convention.
-//const double siCenterXmm =  6.0;
-//const double siCenterYmm = -1.0;
-
-const double siCenterXmm =  siDispXmm;
-const double siCenterYmm =  siDispYmm;
-// z stays 0: SiHitSeedReco seeds with the detector-frame z but builds the TPC residuals with
-// the global z, so a non-zero centre z would shift every chain's dz by D_z = -0.666 cm against
-// the OffsetPrior (sigma 0.35 cm) and the resolver dz sigma.  Apply D_z only in the z-alignment
-// step, together with setTpcZOffset() and the seeding windows.
-const double siCenterZmm =  0.0;
+  // Silicon intrinsic -> ideal detector frame.
+  const double siUphiRotation = 0.1481;
+  // Ideal detector -> global: MVTX + D (D is what the ACTS geometry uses), INTT + 0
+  const double siCenterXmm = siDispXmm;
+  const double siCenterYmm = siDispYmm;
+  // z stays 0: SiHitSeedReco seeds with the detector-frame z but builds the TPC residuals with
+  // the global z, so a non-zero centre z would shift every chain's dz by D_z = -0.666 cm against
+  // the OffsetPrior (sigma 0.35 cm) and the resolver dz sigma.  Apply D_z only in the z-alignment
+  // step, together with setTpcZOffset() and the seeding windows.
+  const double siCenterZmm =  0.0;
+  // INTT: the tracking geometry uses the INTT SURVEY geometry (log: "Use Intt survey geometry? m_inttSurvey =1"):
+  // barrel centre (0.4027, -2.8866) mm, sensor radii 7.453 / 8.046 / 9.934 / 10.569 cm instead of the
+  // design 7.188 / 7.732 / 9.680 / 10.262 cm.  The own geometry (setUseActsGeometry(false)) has the design
+  // radii, so only setUseActsGeometry(true) places the INTT hits right.
+  const double inttCenterXmm = 0.4027, inttCenterYmm = -2.8866, inttCenterZmm = 0.0;
  
   //------------------------------------------------------------
 
   auto* siHitSeed = new SiHitSeedReco("SiHitSeedReco");
   siHitSeed->Verbosity(0);  // 1: run summary + residual widths at End; 2: one line per TPC track (slow); 3: + every chain
   siHitSeed->setUphiRotation(siUphiRotation);
-  siHitSeed->setDetectorCenterMm(siCenterXmm, siCenterYmm, siCenterZmm);
-  //siHitSeed->setDetectorCenterMm(siCenterXmm, siCenterYmm,0.0);
+  siHitSeed->setDetectorCenterMm(siCenterXmm, siCenterYmm, siCenterZmm);   // MVTX
+  siHitSeed->setInttCenterMm(inttCenterXmm, inttCenterYmm, inttCenterZmm);  // INTT
   siHitSeed->setBeamAlignment(beamAlign);
   siHitSeed->setApplySiAlignment(true);                     // default off
   // REQUIRED with setApplySiAlignment(true): no CDB fallback, a missing file aborts the run.
   // Use an absolute path on batch workers.
-  siHitSeed->setSiAlignmentParamsFile("si_align_params_inttshift.txt");
+  // official TRACKINGALIGNMENT constants, unchanged (MVTX centre D + INTT centre 0)
+  siHitSeed->setSiAlignmentParamsFile("si_align_params.txt");
   siHitSeed->setUseNewSiliconRotationOrder(false); 
+  // ---- silicon PHYSICS points (track fits, vertices); chaining always uses the hardware Uphi, Vz
+  siHitSeed->setUseFlatSensorGeometry(true);     // own geometry: flat tilted MVTX staves (false: old cylinders)
+  siHitSeed->setCompareWithActsGeometry(false);  // true: End table own - official (ActsGeometry) positions [mm]
+  // official geometry = the TRKR_CLUSTER positions (MVTX displacement D, INTT SURVEY geometry,
+  // TRACKINGALIGNMENT from the CDB).  With it the INTT centre for the chaining predictions should
+  // be the INTT survey barrel centre (MakeActsGeometry: 0.4027, -2.8866 mm), see inttCenterXmm above.
+  // own - official table (run of 2 events): MVTX dx, dy, dr, r*dphi < 0.04 mm (own MVTX geometry is
+  // right), dz = +6.65 mm = -D_z; INTT dr = -2 ... -3.4 mm, rms 1.3 - 3.2 mm, dz = +5.1 mm (own INTT
+  // geometry is the design one, the data geometry is the survey one) -> use the official positions
+  const bool useActsSiGeometry = true;
+  siHitSeed->setUseActsGeometry(useActsSiGeometry);
+  siHitSeed->setActsZShiftCm(-siDispZmm / 10.0);  // +0.666 cm: same Si z frame as before (MVTX at nominal z), see SiHitSeedReco.h
   //siHitSeed->setDebugEvent(1);  // full dump of one event: very slow, only for debugging
 
   // ---- blobs = hardware clusters (touching MVTX pixels / neighbouring INTT strips, one time bucket)
@@ -532,8 +554,9 @@ const double siCenterZmm =  0.0;
   siTraj->setFitSelectedChainsOnly(true);
   siTraj->setUphiRotation(siUphiRotation);
   siTraj->setDetectorCenterMm(siCenterXmm, siCenterYmm, siCenterZmm);  // same frame as SiHitSeedReco
+  siTraj->setInttCenterMm(inttCenterXmm, inttCenterYmm, inttCenterZmm);
   siTraj->setBeamAlignment(beamAlign);
-  siTraj->setBeamPositionCm(0.0, 0.0);   // the beam is at (0,0) after the alignment
+  siTraj->setBeamPositionCm(0.0, 0.0);   // Si beam at (0,0) after the Si beam-spot correction
   siTraj->setUseIntt(true);
   siTraj->setMinPoints(3);
   siTraj->setZWeights(1.0, 0.01);        // MVTX pixel vs INTT strip length
@@ -548,11 +571,14 @@ const double siCenterZmm =  0.0;
     auto *cluster = new Tpc_PolyClusterizer();  // makes TPC_POLYCLUSTERS
    // cluster->Verbosity(10);
     cluster->setReverseDriftSubsteps(1);
-  // cluster->setMaxAcceptedTier(2); 
+    cluster->setMaxAcceptedTier(2); 
     se->registerSubsystem(cluster);
     //se->registerSubsystem(new Tpc_PolyClusterizer());
     se->registerSubsystem(new Tpc_PolyTrackReco());      // makes TPC_POLYTRACKS
-    se->registerSubsystem(new Tpc_PolyTrackVertexer());  // makes TPC_POLYTRACKVERTICES
+    // Tpc_PolyTrackVertexer (TPC_POLYTRACKVERTICES) is not needed here: the Si+TPC hadron
+    // reconstruction takes the collision vertex from the resolver, and only the (unregistered)
+    // SiTpc_EventDisplay reads that node.
+    //se->registerSubsystem(new Tpc_PolyTrackVertexer());  // makes TPC_POLYTRACKVERTICES
   }
 
   auto* siTpcMatch = new SiTpcTrackMatcher("SiTpcTrackMatcher");
@@ -564,19 +590,29 @@ const double siCenterZmm =  0.0;
   siTpcMatch->setMatchWindowDz0(0.0);    // z0 not used (TPC z depends on the crossing)
   siTpcMatch->setRequireSameCharge(false);
   siTpcMatch->setMinTpcClusters(10);
-  siTpcMatch->setXYWeights(0, 0, 1.0);   // MVTX, INTT, TPC weights in the circle fit
-  siTpcMatch->setZWeights(1, 1, 1.0);    // MVTX, INTT, TPC weights in z(s)
+  // NOTE: with Si xy weights 0 the combined circle (pt, phi, xy pca / DCA) is the TPC-only
+  // circle; the Si points enter only z(s).  TpcHadronReco "sitpc" uses this helix as is, so
+  // DCA_xy has TPC-only (mm) resolution.  For Si-level DCA_xy (D0) either give the Si points
+  // an xy weight here (~ (sigma_TPC / sigma_Si)^2 once the alignment allows it) or use the
+  // "kalman" refit in TpcHadronReco below (Si sigmas from set_si_measurement_sigmas).
+  // xy: Si weight 0 -> TPC-only circle; > 0 -> Si points in the circle (matcher default 10, 10, 1).
+  // TpcHadronReco below sets its DCA_xy cuts from siXYWeightMvtx (siInXY).
+  const double siXYWeightMvtx = 10.0, siXYWeightIntt = 10.0;
+  siTpcMatch->setXYWeights(siXYWeightMvtx, siXYWeightIntt, 1.0);  // MVTX, INTT, TPC weights in the circle fit
+  // z: ~ 1/sigma^2 (MVTX pixel ~50 um incl. misalignment, INTT strip length, TPC after its free offset);
+  // equal weights let the INTT strip centres pull z0 by mm
+  siTpcMatch->setZWeights(1.0, 0.003, 0.01);  // MVTX, INTT, TPC weights in z(s)
   siTpcMatch->setFitTpcZOffset(true);    // free TPC z offset (crossing / t0) in the refit
   se->registerSubsystem(siTpcMatch);
 
   //------------------------------------------------------------
   // Hadron reconstruction from the Si-associated tracks (SITPC_TRACKS).
-  // Same frame as the matcher: beam at (0, 0) after beamAlign, collision vertex z
+  // Same frame as the matcher: beam at (0, 0) after beamAlign (Si and TPC centred), collision vertex z
   // = Si vertex z of TpcCrossingResolver; pairs only inside one collision.
   if (runHadronReco)
   {
     auto *hadron = new tpchadronreco::TpcV0CandidateTree(
-        "TpcV0CandidateTree", outdir + "/hadron_sitpc_" + outfilename + ".root");
+        "TpcV0CandidateTree", outdir + "/hadron_sitpc_" + outfilename +"_" + std::to_string(runnumber)+"_" + std::to_string(segment)+ ".root");
     hadron->Verbosity(0);
     hadron->use_sitpc_tracks(true);
     hadron->set_sitpc_track_node("SITPC_TRACKS");
@@ -596,17 +632,24 @@ const double siCenterZmm =  0.0;
     // collision vertex: Si vertex z of the resolver (fallback: robust mean of the prompt Si+TPC tracks)
     hadron->set_sitpc_vertex_mode("resolver");
     hadron->set_sitpc_vertex_track_selection(0.1, 0.5, 2);  // |dca_xy| [cm], z window [cm], min tracks
-    hadron->set_sitpc_beam_line(0.0, 0.0, 0.0, 0.0);        // TPC frame, beam centred by beamAlign
+    // beam at (0, 0) in the matcher frame: Si by correctSiBeamSpot, TPC by centerTpcBeamToo (both above)
+    hadron->set_sitpc_beam_line(0.0, 0.0, 0.0, 0.0);
     hadron->set_primary_vertex(0.0, 0.0, 0.0);              // fallback only
 
-    // track model: "sitpc" = SiTpcTrackMatcher combined helix (no refit), or "kalman"
-    hadron->set_track_fit_method("sitpc");
+    // track model: "sitpc" = SiTpcTrackMatcher combined helix (no refit; xy = TPC only while
+    // the matcher's Si xy weights are 0), or "kalman" = refit of the Si + TPC points with the
+    // field map (Si in xy too; inflate the Si sigmas below while the alignment is not final)
+    const std::string hadronFitMethod = "sitpc";
+    hadron->set_track_fit_method(hadronFitMethod);
+    // Si points in the xy fit: kalman refit, or the matcher circle with a Si xy weight
+    const bool siInXY = hadronFitMethod == "kalman" || siXYWeightMvtx > 0.0;
     hadron->set_bfield(1.4);                                // same as SiTpcTrackMatcher::setBz
     hadron->set_min_points(12);
     hadron->set_point_order("radius-descending");
     hadron->set_sitpc_helix_search(10.0, 5.0);
     //                               MVTX rphi    r     z  | INTT rphi    r     z  [cm]
-    hadron->set_si_measurement_sigmas(0.0010, 0.0010, 0.0010, 0.0030, 0.0030, 0.50);
+    // (kalman only) MVTX / INTT sigmas incl. residual misalignment
+    hadron->set_si_measurement_sigmas(0.0050, 0.0050, 0.0050, 0.0100, 0.0100, 0.50);
 
     // loose pair preselection
     hadron->set_pre_track_pt_min(0.15);
@@ -615,16 +658,25 @@ const double siCenterZmm =  0.0;
     hadron->set_pre_lproj_min(-1.0);
     hadron->set_pre_track_npoints_min(12);
 
-    // phi -> K+ K-  (prompt):    clu  pt   mass        |dca_xy| |dca_z| pairDCA flight  |pca z| pca dz
-    hadron->set_phi_selection(true, 10, 0.15, 0.98, 1.08, 0.10,    0.20,   -1.0,   -1.0,   20.0,   0.20);
+    // DCA_xy cut: Si-level only if the Si points are in the xy fit; with the TPC-only circle
+    // keep it at the TPC resolution (check trackTree: sitpc_dca for has_si == 1).
+    // z is Si-constrained in both cases (z0 from the Si points), so dca_z / pca dz stay tight.
+    const double phiDcaXY = siInXY ? 0.10 : 1.0;
+    const double d0DcaXY = siInXY ? 0.50 : 1.0;
+    // phi -> K+ K-  (prompt):    clu  pt   mass        |dca_xy|  |dca_z| pairDCA flight  |pca z| pca dz
+    hadron->set_phi_selection(true, 10, 0.15, 0.98, 1.08, phiDcaXY, 0.20,   -1.0,   -1.0,   20.0,   0.20);
     // D0 -> K- pi+, anti-D0 -> K+ pi-
-    hadron->set_d0_selection(true, 10, 0.20, 1.70, 2.05, 0.50, 0.30, -1.0, -1.0, 20.0, 0.30);
-    hadron->set_antid0_selection(true, 10, 0.20, 1.70, 2.05, 0.50, 0.30, -1.0, -1.0, 20.0, 0.30);
+    hadron->set_d0_selection(true, 10, 0.20, 1.70, 2.05, d0DcaXY, 0.30, -1.0, -1.0, 20.0, 0.30);
+    hadron->set_antid0_selection(true, 10, 0.20, 1.70, 2.05, d0DcaXY, 0.30, -1.0, -1.0, 20.0, 0.30);
     // displaced D0 vertex (on top of the D0 selection; starting values, tune on data):
     //                                      Lxy  L_min L_max  DIRA  |d0|_min pairDCA pointDCA d0*d0
     hadron->set_d0_displaced_selection(false, 0.0, -1.0, 0.5,  0.90, 0.005,   0.03,   0.01,    2.0);
 
-    // V0s (only the decays inside the MVTX are Si-matched; see set_sitpc_add_unmatched_tpc_tracks)
+    // V0s: only decays inside the MVTX (r < ~2.5 cm, Lambda c tau = 7.9 cm) have Si-matched
+    // daughters, so Si-only K0S/Lambda samples are mostly prompt combinatorics.  For V0s use
+    // set_sitpc_add_unmatched_tpc_tracks(true) (TPC-only daughters, vertex of their crossing).
+    // mass_Lambda / mass_AntiLambda are filled for EVERY written pair (also rows written for
+    // K0S / phi / D0): select Lambda with (candidate_mask & 2), anti-Lambda with (candidate_mask & 4).
     hadron->set_kshort_selection(true, 10, 0.0, 0.40, 0.60, 20.0, 0.3, 0.05, 1.0, 0.5, 0.9);
     hadron->set_lambda_selection(true, 10, 0.0, 1.08, 1.16, 20.0, 0.3, 0.05, 1.0, 0.5, 0.9);
     hadron->set_antilambda_selection(true, 10, 0.0, 1.08, 1.16, 20.0, 0.3, 0.05, 1.0, 0.5, 0.9);
@@ -646,7 +698,7 @@ const double siCenterZmm =  0.0;
   siTpcResid->setMinPt(0.1);
   siTpcResid->setMinTpcClusters(10);
   siTpcResid->setWriteMatchingTree(true);
-  se->registerSubsystem(siTpcResid);
+  //se->registerSubsystem(siTpcResid);
 
   auto* display = new SiTpc_EventDisplay("SiTpc_EventDisplay", outdir + "/sitpc_event_display_" + outfilename + ".root", 10);  // max events saved
   display->Verbosity(0);
@@ -659,6 +711,7 @@ const double siCenterZmm =  0.0;
   display->setSiTrajectoryNodeName("SI_TRAJECTORY");
   display->setUphiRotation(siUphiRotation);
   display->setDetectorCenterMm(siCenterXmm, siCenterYmm);  // display: x, y only
+  display->setInttCenterMm(inttCenterXmm, inttCenterYmm);
   display->setBeamAlignment(beamAlign);
   display->setBeamPositionCm(0.0, 0.0);
   display->setSiMinPt(0.2);  // circle fits below this are drawn dotted
@@ -683,7 +736,7 @@ const double siCenterZmm =  0.0;
   //out->AddNode("TPC_ASSEMBLEDTRACKS");
   out->AddNode("TPC_POLYCLUSTERS");
   out->AddNode("TPC_POLYTRACKS");
-  out->AddNode("TPC_POLYTRACKVERTICES");
+  //out->AddNode("TPC_POLYTRACKVERTICES");  // Tpc_PolyTrackVertexer not run
   out->AddNode("TRKR_CLUSTER");
   // Si-associated reconstruction, input of TpcHadronReco in a separate pass
   // (Fun4All_TpcV0CandidateTree.C with V0_TRACK_SOURCE=sitpc)
