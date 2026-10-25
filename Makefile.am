@@ -61,7 +61,8 @@ libTpcHadronReco_la_LIBADD = \
   -ltrackeralign \
   -ltrackbase_historic_io \
   -ltpctrackreco \
-  -lsitrackreco
+  -lsitrackreco \
+  -lglobalvertex_io
 
 clean-local:
 	rm -f $(BUILT_SOURCES)

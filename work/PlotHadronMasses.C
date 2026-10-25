@@ -268,9 +268,9 @@ void ScanD0Bin(const char *input, const double mass_min = 1.84, const double mas
 }
 
 //"both"
-void PlotHadronMasses(const char *input = "/sphenix/tg/tg01/hf/mitrankova/Hadrons/hadron_sitpc_HITS_pp_79513_1*.root",
+void PlotHadronMasses(const char *input = "/sphenix/tg/tg01/hf/mitrankova/Hadrons/hadron_sitpc_HITS_pp_79513_*.root",
                       const char *extra_selection = "",
-                      const char *output_pdf = "hadron_masses_new_si_aligned_si_fit_7780K.pdf",
+                      const char *output_pdf = "hadron_masses_new_si_aligned_si_fit_1file_new.pdf",
                       const char *d0_mode = "unique")
 {
   gStyle->SetOptStat(0);

@@ -26,6 +26,7 @@ class Tpc_PolyTrackContainer;
 class Tpc_PolyTrackVertexContainer;
 class TpcCrossingDecisionContainer;
 class SiTpc_TrackContainer;
+class SvtxVertexMap;
 
 namespace tpchadronreco
 {
@@ -113,10 +114,18 @@ namespace tpchadronreco
     }
     // Move the TPC points by the fitted TPC z offset into the Si z frame (default true).
     void set_sitpc_apply_tpc_z_offset(const bool value = true) { m_sitpc_apply_tpc_z_offset = value; }
-    // Collision vertex: "resolver" (Si vertex z of TpcCrossingResolver, fallback
-    // to "tracks"), "tracks" (robust mean of the Si+TPC z at the beam of the
-    // prompt tracks of the collision), "fixed" (set_primary_vertex).
+    // Collision vertex:
+    //   "map"      : fitted vertices of SiTpc_VertexFinder (SvtxVertexMap, default node
+    //                SiTpcPolyVertexMap): a track takes the vertex that contains it, otherwise the
+    //                vertex of its crossing nearest in z (its z at the beam); fallback "resolver"
+    //   "resolver" : Si vertex z of TpcCrossingResolver on the beam line, fallback "tracks"
+    //   "tracks"   : robust mean of the z at the beam (current fit) of the prompt tracks
+    //   "fixed"    : set_primary_vertex
     bool set_sitpc_vertex_mode(const std::string &mode);
+    void set_sitpc_vertex_map_node(const std::string &name) { m_sitpc_vertex_map_node = name; }
+    // "map": a track not in any vertex is attached to the nearest vertex of its crossing only
+    // within this |dz| at the beam [cm] (< 0: no limit); otherwise it gets the resolver fallback
+    void set_sitpc_vertex_attach_max_dz(const double value) { m_sitpc_vertex_attach_max_dz = value; }
     void set_sitpc_vertex_track_selection(const double dca_xy_max_cm,
                                           const double z_window_cm,
                                           const unsigned int min_tracks)
@@ -670,6 +679,7 @@ namespace tpchadronreco
       unsigned int n_intt{0};
       unsigned int n_si_points{0};
       int sitpc_fit_status{0};
+      unsigned int sitpc_id{0};  // SiTpc_Track::get_id (track id in the SiTpc_VertexFinder vertices)
       double sitpc_dca{0.0};
       double sitpc_z0{0.0};
       double sitpc_circle_rms{0.0};
@@ -681,11 +691,14 @@ namespace tpchadronreco
       bool has_si_vertex_z{false};
 
       // Collision (primary) vertex of this track: 0 fixed, 1 resolver Si z,
-      // 2 robust mean of the tracks of the collision.
+      // 2 robust mean of the tracks of the collision, 3 SiTpc_VertexFinder vertex.
       bool has_collision_vertex{false};
       Vec3 collision_vertex;
+      Vec3 collision_vertex_sigma;  // sqrt of the diagonal covariance [cm] (NaN if unknown)
       int collision_vertex_source{0};
       unsigned int collision_vertex_ntracks{0};
+      int collision_id{-1};            // pairs are formed inside one (crossing, collision_id)
+      bool in_collision_vertex{false};  // the track was used in the fit of its vertex
     };
 
     struct LambdaCandidate
@@ -1156,8 +1169,13 @@ namespace tpchadronreco
       float pv_x{0.0F};
       float pv_y{0.0F};
       float pv_z{0.0F};
+      float pv_ex{0.0F};
+      float pv_ey{0.0F};
+      float pv_ez{0.0F};
       int pv_source{0};
       unsigned int pv_ntracks{0};
+      int in_pv1{0};  // daughter used in the vertex fit (vertex map only)
+      int in_pv2{0};
 
       // ---- displaced two-track vertex (D0) w.r.t. the primary vertex
       float signed_dca_xy1{0.0F};
@@ -1196,8 +1214,10 @@ namespace tpchadronreco
       float pv_x{0.0F};
       float pv_y{0.0F};
       float pv_z{0.0F};
+      float pv_ez{0.0F};
       int pv_source{0};
       unsigned int pv_ntracks{0};
+      int in_pv{0};
       int track_id{0};
       unsigned int source_assembled_track_id{0};
       int crossing_valid{0};
@@ -1377,7 +1397,9 @@ namespace tpchadronreco
                                                   Tpc_PolyTrackContainer *tpc_tracks,
                                                   const TpcCrossingDecisionContainer *crossing_decisions) const;
     bool finalize_sitpc_native_helix(Tracklet &tracklet) const;
-    void assign_sitpc_collision_vertices(std::map<int, Tracklet> &tracklets) const;
+    void assign_sitpc_collision_vertices(std::map<int, Tracklet> &tracklets,
+                                         const SvtxVertexMap *vertex_map) const;
+    bool tracklet_z_at_beam(const Tracklet &tracklet, double &z, double &dca_xy) const;
     Vec3 beam_at_z(double z) const;
     const Vec3 &tracklet_primary_vertex(const Tracklet &tracklet, const Vec3 &fallback) const;
     Vec3 pair_primary_vertex(const Tracklet &track1, const Tracklet &track2,
@@ -1613,6 +1635,7 @@ namespace tpchadronreco
     // ---- Si-associated tracks
     enum class SiTpcVertexMode
     {
+      Map,
       Resolver,
       Tracks,
       Fixed
@@ -1632,6 +1655,10 @@ namespace tpchadronreco
     bool m_sitpc_require_timed_collision{false};
     bool m_sitpc_apply_tpc_z_offset{true};
     SiTpcVertexMode m_sitpc_vertex_mode{SiTpcVertexMode::Resolver};
+    std::string m_sitpc_vertex_map_node{"SiTpcPolyVertexMap"};
+    double m_sitpc_vertex_attach_max_dz{0.5};
+    mutable std::uint64_t m_counter_sitpc_vertex_map{0};
+    mutable std::uint64_t m_counter_sitpc_vertex_map_attached{0};
     double m_sitpc_vertex_track_dca_xy_max_cm{0.1};
     double m_sitpc_vertex_track_z_window_cm{0.5};
     unsigned int m_sitpc_vertex_min_tracks{2};

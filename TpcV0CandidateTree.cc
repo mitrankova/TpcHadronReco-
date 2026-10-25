@@ -13,6 +13,8 @@
 
 #include <sitrackreco/SiTpc_TrackContainer.h>
 
+#include <globalvertex/SvtxVertexMap.h>
+
 #include <trackbase/TrkrDefs.h>
 
 #include <g4main/PHG4EventHeader.h>
@@ -791,7 +793,7 @@ namespace tpchadronreco
                 << ", min MVTX/INTT/Si/TPC = " << m_sitpc_min_mvtx << "/" << m_sitpc_min_intt
                 << "/" << m_sitpc_min_si_points << "/" << m_sitpc_min_tpc_points
                 << ", max tier " << m_sitpc_max_crossing_tier
-                << ", vertex " << (m_sitpc_vertex_mode == SiTpcVertexMode::Resolver ? "resolver" : (m_sitpc_vertex_mode == SiTpcVertexMode::Tracks ? "tracks" : "fixed"))
+                << ", vertex " << (m_sitpc_vertex_mode == SiTpcVertexMode::Map ? "map " + m_sitpc_vertex_map_node : (m_sitpc_vertex_mode == SiTpcVertexMode::Resolver ? std::string("resolver") : (m_sitpc_vertex_mode == SiTpcVertexMode::Tracks ? std::string("tracks") : std::string("fixed"))))
                 << ", unmatched TPC tracks " << (m_sitpc_add_unmatched_tpc_tracks ? "on" : "off")
                 << ", D0 displaced selection " << (m_d0_displaced_cuts.enabled ? "on" : "off")
                 << ")" << std::endl;
@@ -909,7 +911,17 @@ namespace tpchadronreco
                     << m_tpc_sa_track_node << "; no unmatched TPC tracks added" << std::endl;
         }
       }
-      assign_sitpc_collision_vertices(tracklet_map);
+      const SvtxVertexMap *vertex_map = nullptr;
+      if (m_sitpc_vertex_mode == SiTpcVertexMode::Map)
+      {
+        vertex_map = findNode::getClass<SvtxVertexMap>(topNode, m_sitpc_vertex_map_node);
+        if (!vertex_map && Verbosity() > 0)
+        {
+          std::cout << PHWHERE << Name() << ": missing vertex map " << m_sitpc_vertex_map_node
+                    << " (register SiTpc_VertexFinder before this module); resolver fallback" << std::endl;
+        }
+      }
+      assign_sitpc_collision_vertices(tracklet_map, vertex_map);
     }
     else if (m_use_pattern_cluster_tracks)
     {
@@ -1057,16 +1069,19 @@ namespace tpchadronreco
     }
 
     // Pair / hyperon stage.  Si+TPC tracks with set_require_same_crossing:
-    // one pass per collision (resolved crossing) with that collision's vertex.
+    // one pass per collision with that collision's vertex.  A collision is a resolved
+    // crossing and, with the vertex map, one fitted vertex of that crossing (two vertices
+    // in one crossing are two collisions).
     std::vector<std::pair<Vec3, std::vector<const Tracklet *>>> collision_groups;
     if (m_use_sitpc_tracks && m_require_same_crossing)
     {
-      std::map<std::pair<int, short>, std::size_t> group_index;
+      std::map<std::tuple<int, short, int>, std::size_t> group_index;
       for (const auto *tracklet : tracklets)
       {
-        const std::pair<int, short> key{tracklet->crossing_valid ? 1 : 0,
-                                        tracklet->crossing_valid ? tracklet->crossing
-                                                                 : static_cast<short>(0)};
+        const std::tuple<int, short, int> key{tracklet->crossing_valid ? 1 : 0,
+                                              tracklet->crossing_valid ? tracklet->crossing
+                                                                       : static_cast<short>(0),
+                                              tracklet->collision_id};
         auto iter = group_index.find(key);
         if (iter == group_index.end())
         {
@@ -1222,9 +1237,11 @@ namespace tpchadronreco
                   << " rejected(fit)=" << m_counter_sitpc_reject_fit
                   << " rejected(quality)=" << m_counter_sitpc_reject_quality
                   << " rejected(crossing)=" << m_counter_sitpc_reject_crossing
-                  << " collision vertices resolver/tracks/fixed="
-                  << m_counter_sitpc_vertex_resolver << "/" << m_counter_sitpc_vertex_tracks
-                  << "/" << m_counter_sitpc_vertex_fixed << std::endl;
+                  << " tracks with vertex from map/resolver/tracks/fixed="
+                  << m_counter_sitpc_vertex_map << "/" << m_counter_sitpc_vertex_resolver << "/"
+                  << m_counter_sitpc_vertex_tracks << "/" << m_counter_sitpc_vertex_fixed
+                  << " (map: attached by nearest z " << m_counter_sitpc_vertex_map_attached << ")"
+                  << std::endl;
       }
       if (m_pair_tree)
       {
@@ -1877,12 +1894,27 @@ namespace tpchadronreco
     TpcKalmanVertexConstraintResult constrained;
     const bool constrain_z =
         m_primary_vertex_constraint_mode == PrimaryVertexConstraintMode::XYZ;
+    // the configured sigmas are a floor; a fitted collision vertex adds its own error
+    double sigma_xy = m_primary_vertex_constraint_sigma_xy_cm;
+    double sigma_z = m_primary_vertex_constraint_sigma_z_cm;
+    if (m_use_sitpc_tracks && tracklet.has_collision_vertex)
+    {
+      const Vec3 &e = tracklet.collision_vertex_sigma;
+      if (std::isfinite(e.x) && std::isfinite(e.y))
+      {
+        sigma_xy = std::max(sigma_xy, std::max(e.x, e.y));
+      }
+      if (std::isfinite(e.z))
+      {
+        sigma_z = std::max(sigma_z, e.z);
+      }
+    }
     if (!TpcTrackKalmanFitter::constrain_to_vertex(
             tracklet.kalman,
             primary_vertex,
             m_kalman_config,
-            m_primary_vertex_constraint_sigma_xy_cm,
-            m_primary_vertex_constraint_sigma_z_cm,
+            sigma_xy,
+            sigma_z,
             constrain_z,
             constrained))
     {
@@ -3271,6 +3303,14 @@ namespace tpchadronreco
       const Tracklet &vertex_track = track1.has_collision_vertex ? track1 : track2;
       m_pair.pv_source = vertex_track.has_collision_vertex ? vertex_track.collision_vertex_source : 0;
       m_pair.pv_ntracks = vertex_track.has_collision_vertex ? vertex_track.collision_vertex_ntracks : 0;
+      if (vertex_track.has_collision_vertex)
+      {
+        m_pair.pv_ex = static_cast<float>(vertex_track.collision_vertex_sigma.x);
+        m_pair.pv_ey = static_cast<float>(vertex_track.collision_vertex_sigma.y);
+        m_pair.pv_ez = static_cast<float>(vertex_track.collision_vertex_sigma.z);
+      }
+      m_pair.in_pv1 = track1.in_collision_vertex ? 1 : 0;
+      m_pair.in_pv2 = track2.in_collision_vertex ? 1 : 0;
     }
 
     m_pair.signed_dca_xy1 = static_cast<float>(displaced.signed_dca_xy1);
@@ -4409,6 +4449,11 @@ namespace tpchadronreco
     m_track.pv_z = static_cast<float>(primary_vertex.z);
     m_track.pv_source = tracklet.has_collision_vertex ? tracklet.collision_vertex_source : 0;
     m_track.pv_ntracks = tracklet.has_collision_vertex ? tracklet.collision_vertex_ntracks : 0;
+    if (tracklet.has_collision_vertex)
+    {
+      m_track.pv_ez = static_cast<float>(tracklet.collision_vertex_sigma.z);
+    }
+    m_track.in_pv = tracklet.in_collision_vertex ? 1 : 0;
     m_track.track_id = tracklet.track_id;
     m_track.source_assembled_track_id = tracklet.source_assembled_track_id;
     m_track.crossing_valid = tracklet.crossing_valid ? 1 : 0;
@@ -4933,6 +4978,9 @@ namespace tpchadronreco
     m_pair.pv_x = nan;
     m_pair.pv_y = nan;
     m_pair.pv_z = nan;
+    m_pair.pv_ex = nan;
+    m_pair.pv_ey = nan;
+    m_pair.pv_ez = nan;
     m_pair.signed_dca_xy1 = nan;
     m_pair.signed_dca_xy2 = nan;
     m_pair.dca_product = nan;
@@ -5087,6 +5135,7 @@ namespace tpchadronreco
     m_track.pv_x = nan;
     m_track.pv_y = nan;
     m_track.pv_z = nan;
+    m_track.pv_ez = nan;
     m_track.px = nan;
     m_track.py = nan;
     m_track.pz = nan;
@@ -5380,6 +5429,11 @@ namespace tpchadronreco
     tree->Branch("pv_z", &m_pair.pv_z, "pv_z/F");
     tree->Branch("pv_source", &m_pair.pv_source, "pv_source/I");
     tree->Branch("pv_ntracks", &m_pair.pv_ntracks, "pv_ntracks/i");
+    tree->Branch("pv_ex", &m_pair.pv_ex, "pv_ex/F");
+    tree->Branch("pv_ey", &m_pair.pv_ey, "pv_ey/F");
+    tree->Branch("pv_ez", &m_pair.pv_ez, "pv_ez/F");
+    tree->Branch("in_pv1", &m_pair.in_pv1, "in_pv1/I");
+    tree->Branch("in_pv2", &m_pair.in_pv2, "in_pv2/I");
 
     // displaced two-track vertex (D0)
     tree->Branch("signed_dca_xy1", &m_pair.signed_dca_xy1, "signed_dca_xy1/F");
@@ -5564,6 +5618,8 @@ namespace tpchadronreco
     m_track_tree->Branch("pv_z", &m_track.pv_z, "pv_z/F");
     m_track_tree->Branch("pv_source", &m_track.pv_source, "pv_source/I");
     m_track_tree->Branch("pv_ntracks", &m_track.pv_ntracks, "pv_ntracks/i");
+    m_track_tree->Branch("pv_ez", &m_track.pv_ez, "pv_ez/F");
+    m_track_tree->Branch("in_pv", &m_track.in_pv, "in_pv/I");
     m_track_tree->Branch("has_helix", &m_track.has_helix, "has_helix/I");
     m_track_tree->Branch("has_kalman", &m_track.has_kalman, "has_kalman/I");
     m_track_tree->Branch("is_primary", &m_track.is_primary, "is_primary/I");

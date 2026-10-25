@@ -18,6 +18,9 @@
 #include <tpctrackreco/Tpc_PolyTrack.h>
 #include <tpctrackreco/Tpc_PolyTrackContainer.h>
 
+#include <globalvertex/SvtxVertex.h>
+#include <globalvertex/SvtxVertexMap.h>
+
 #include <phool/phool.h>
 
 #include <algorithm>
@@ -107,6 +110,11 @@ namespace tpchadronreco
   bool TpcV0CandidateTree::set_sitpc_vertex_mode(const std::string &mode)
   {
     const std::string value = lowered(mode);
+    if (value == "map" || value == "vertexmap" || value == "fit")
+    {
+      m_sitpc_vertex_mode = SiTpcVertexMode::Map;
+      return true;
+    }
     if (value == "resolver" || value == "si" || value == "silicon")
     {
       m_sitpc_vertex_mode = SiTpcVertexMode::Resolver;
@@ -123,7 +131,7 @@ namespace tpchadronreco
       return true;
     }
     std::cerr << PHWHERE << Name() << ": unknown Si+TPC vertex mode '" << mode
-              << "'. Valid modes are resolver, tracks, and fixed." << std::endl;
+              << "'. Valid modes are map, resolver, tracks, and fixed." << std::endl;
     return false;
   }
 
@@ -288,6 +296,7 @@ namespace tpchadronreco
 
       tracklet.has_si = true;
       tracklet.sitpc_index = itrack;
+      tracklet.sitpc_id = track->get_id();
       tracklet.si_chain_id = track->get_si_chain_id();
       tracklet.n_mvtx = n_mvtx;
       tracklet.n_intt = n_intt;
@@ -470,8 +479,44 @@ namespace tpchadronreco
             z};
   }
 
-  void TpcV0CandidateTree::assign_sitpc_collision_vertices(std::map<int, Tracklet> &tracklets) const
+  bool TpcV0CandidateTree::tracklet_z_at_beam(const Tracklet &tracklet, double &z, double &dca_xy) const
   {
+    // z and signed DCA_xy at the transverse PCA to the beam line, from the track model used for
+    // the pairs (Kalman refit, helix, or the Si+TPC matcher helix): the vertex and the DCAs use
+    // the same tracks.
+    Vec3 pca;
+    double dca = std::numeric_limits<double>::quiet_NaN();
+    const Vec3 beam = beam_at_z(std::isfinite(tracklet.sitpc_z0) ? tracklet.sitpc_z0 : 0.0);
+    if (!track_pca_to_xy(tracklet, beam, pca, dca) || !std::isfinite(pca.z) || !std::isfinite(dca))
+    {
+      return false;
+    }
+    z = pca.z;
+    dca_xy = dca;
+    return true;
+  }
+
+  void TpcV0CandidateTree::assign_sitpc_collision_vertices(std::map<int, Tracklet> &tracklets,
+                                                           const SvtxVertexMap *vertex_map) const
+  {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    // z at the beam of every track with the current fit (used by "tracks" and by the
+    // nearest-vertex attachment of "map")
+    std::map<int, double> z_at_beam;
+    std::map<int, double> dca_at_beam;
+    for (const auto &entry : tracklets)
+    {
+      double z = nan;
+      double dca = nan;
+      if (tracklet_z_at_beam(entry.second, z, dca))
+      {
+        z_at_beam[entry.first] = z;
+        dca_at_beam[entry.first] = dca;
+      }
+    }
+
+    // ---- per-crossing fallback (resolver Si z, robust mean of the tracks, fixed)
     struct Accumulator
     {
       std::vector<double> si_z;
@@ -490,29 +535,34 @@ namespace tpchadronreco
       {
         acc.si_z.push_back(tracklet.si_vertex_z);
       }
-      if (tracklet.has_si && std::isfinite(tracklet.sitpc_z0) &&
+      const auto iz = z_at_beam.find(entry.first);
+      if (tracklet.has_si && iz != z_at_beam.end() &&
           (m_sitpc_vertex_track_dca_xy_max_cm < 0.0 ||
-           std::abs(tracklet.sitpc_dca) <= m_sitpc_vertex_track_dca_xy_max_cm))
+           std::abs(dca_at_beam[entry.first]) <= m_sitpc_vertex_track_dca_xy_max_cm))
       {
-        acc.track_z.push_back(tracklet.sitpc_z0);
+        acc.track_z.push_back(iz->second);
       }
     }
 
     struct Collision
     {
       Vec3 vertex;
+      Vec3 sigma{std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
+                 std::numeric_limits<double>::quiet_NaN()};
       int source{0};
       unsigned int ntracks{0};
     };
-    std::map<short, Collision> collisions;
+    std::map<short, Collision> fallback;
     for (const auto &entry : by_crossing)
     {
       Collision collision;
       collision.vertex = m_fixed_primary_vertex;
       const Accumulator &acc = entry.second;
+      const bool try_resolver = m_sitpc_vertex_mode == SiTpcVertexMode::Resolver ||
+                                m_sitpc_vertex_mode == SiTpcVertexMode::Map;
 
       bool done = false;
-      if (m_sitpc_vertex_mode == SiTpcVertexMode::Resolver && !acc.si_z.empty())
+      if (try_resolver && !acc.si_z.empty())
       {
         const double z = median_of(acc.si_z);
         if (std::isfinite(z))
@@ -526,7 +576,7 @@ namespace tpchadronreco
       if (!done && m_sitpc_vertex_mode != SiTpcVertexMode::Fixed &&
           acc.track_z.size() >= std::max(1U, m_sitpc_vertex_min_tracks))
       {
-        double z = std::numeric_limits<double>::quiet_NaN();
+        double z = nan;
         const unsigned int used = robust_location(acc.track_z, m_sitpc_vertex_track_z_window_cm, z);
         if (used >= std::max(1U, m_sitpc_vertex_min_tracks) && std::isfinite(z))
         {
@@ -536,19 +586,48 @@ namespace tpchadronreco
           done = true;
         }
       }
-      if (collision.source == 1)
+      fallback[entry.first] = collision;
+    }
+
+    // ---- fitted vertices (SiTpc_VertexFinder): per crossing, and track id -> vertex
+    struct FittedVertex
+    {
+      unsigned int id{0};
+      Vec3 position;
+      Vec3 sigma;
+      unsigned int ntracks{0};
+    };
+    std::map<short, std::vector<FittedVertex>> fitted_by_crossing;
+    std::map<unsigned int, std::pair<short, std::size_t>> vertex_of_track;  // SiTpc id -> (crossing, index)
+    const bool use_map = m_sitpc_vertex_mode == SiTpcVertexMode::Map && vertex_map;
+    if (use_map)
+    {
+      for (auto iter = vertex_map->begin(); iter != vertex_map->end(); ++iter)
       {
-        ++m_counter_sitpc_vertex_resolver;
+        const SvtxVertex *vertex = iter->second;
+        if (!vertex)
+        {
+          continue;
+        }
+        FittedVertex fv;
+        fv.id = iter->first;
+        fv.position = {vertex->get_x(), vertex->get_y(), vertex->get_z()};
+        if (!finite(fv.position))
+        {
+          continue;
+        }
+        fv.sigma = {std::sqrt(std::max(0.0F, vertex->get_error(0, 0))),
+                    std::sqrt(std::max(0.0F, vertex->get_error(1, 1))),
+                    std::sqrt(std::max(0.0F, vertex->get_error(2, 2)))};
+        fv.ntracks = static_cast<unsigned int>(vertex->size_tracks());
+        const short crossing = static_cast<short>(vertex->get_beam_crossing());
+        auto &list = fitted_by_crossing[crossing];
+        for (auto it = vertex->begin_tracks(); it != vertex->end_tracks(); ++it)
+        {
+          vertex_of_track[*it] = {crossing, list.size()};
+        }
+        list.push_back(fv);
       }
-      else if (collision.source == 2)
-      {
-        ++m_counter_sitpc_vertex_tracks;
-      }
-      else
-      {
-        ++m_counter_sitpc_vertex_fixed;
-      }
-      collisions[entry.first] = collision;
     }
 
     for (auto &entry : tracklets)
@@ -556,21 +635,92 @@ namespace tpchadronreco
       Tracklet &tracklet = entry.second;
       tracklet.has_collision_vertex = false;
       tracklet.collision_vertex = m_fixed_primary_vertex;
+      tracklet.collision_vertex_sigma = {nan, nan, nan};
       tracklet.collision_vertex_source = 0;
       tracklet.collision_vertex_ntracks = 0;
+      tracklet.collision_id = -1;
+      tracklet.in_collision_vertex = false;
       if (!tracklet.crossing_valid)
       {
         continue;
       }
-      const auto iter = collisions.find(tracklet.crossing);
-      if (iter == collisions.end())
+
+      if (use_map)
+      {
+        const FittedVertex *chosen = nullptr;
+        // 1. the vertex that contains this Si+TPC track (ids of the same event's SITPC_TRACKS)
+        if (tracklet.has_si)
+        {
+          const auto it = vertex_of_track.find(tracklet.sitpc_id);
+          if (it != vertex_of_track.end() && it->second.first == tracklet.crossing)
+          {
+            chosen = &fitted_by_crossing[it->second.first][it->second.second];
+            tracklet.in_collision_vertex = true;
+          }
+        }
+        // 2. otherwise the vertex of its crossing nearest in z at the beam
+        if (!chosen)
+        {
+          const auto ic = fitted_by_crossing.find(tracklet.crossing);
+          const auto iz = z_at_beam.find(entry.first);
+          if (ic != fitted_by_crossing.end() && iz != z_at_beam.end())
+          {
+            double best = std::numeric_limits<double>::max();
+            for (const auto &fv : ic->second)
+            {
+              const double dz = std::abs(iz->second - fv.position.z);
+              if (dz < best)
+              {
+                best = dz;
+                chosen = &fv;
+              }
+            }
+            if (chosen && m_sitpc_vertex_attach_max_dz >= 0.0 && best > m_sitpc_vertex_attach_max_dz)
+            {
+              chosen = nullptr;
+            }
+            if (chosen)
+            {
+              ++m_counter_sitpc_vertex_map_attached;
+            }
+          }
+        }
+        if (chosen)
+        {
+          tracklet.has_collision_vertex = true;
+          tracklet.collision_vertex = chosen->position;
+          tracklet.collision_vertex_sigma = chosen->sigma;
+          tracklet.collision_vertex_source = 3;
+          tracklet.collision_vertex_ntracks = chosen->ntracks;
+          tracklet.collision_id = static_cast<int>(chosen->id);
+          ++m_counter_sitpc_vertex_map;
+          continue;
+        }
+      }
+
+      const auto iter = fallback.find(tracklet.crossing);
+      if (iter == fallback.end())
       {
         continue;
       }
       tracklet.has_collision_vertex = true;
       tracklet.collision_vertex = iter->second.vertex;
+      tracklet.collision_vertex_sigma = iter->second.sigma;
       tracklet.collision_vertex_source = iter->second.source;
       tracklet.collision_vertex_ntracks = iter->second.ntracks;
+      tracklet.collision_id = -1;  // one fallback collision per crossing
+      if (iter->second.source == 1)
+      {
+        ++m_counter_sitpc_vertex_resolver;
+      }
+      else if (iter->second.source == 2)
+      {
+        ++m_counter_sitpc_vertex_tracks;
+      }
+      else
+      {
+        ++m_counter_sitpc_vertex_fixed;
+      }
     }
   }
 
@@ -590,9 +740,10 @@ namespace tpchadronreco
     }
     if (track1.has_collision_vertex && track2.has_collision_vertex)
     {
-      // Different crossings only reach here without set_require_same_crossing:
+      // Different collisions only reach here without set_require_same_crossing:
       // use the vertex of the better-timed (Si-matched) track.
-      if (track1.crossing == track2.crossing || track1.has_si || !track2.has_si)
+      if ((track1.crossing == track2.crossing && track1.collision_id == track2.collision_id) ||
+          track1.has_si || !track2.has_si)
       {
         return track1.collision_vertex;
       }

@@ -9,5 +9,5 @@ request_memory     = 8GB
 request_cpus       = 3
 Priority           = 20
 job_lease_duration = 3600
-Arguments          = 2000 $(process) 0
-Queue 3890
+Arguments          = 1000 $(process) 0
+Queue 1111
