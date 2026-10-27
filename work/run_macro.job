@@ -1,0 +1,18 @@
+# One job per hadron file for one macro:
+#   condor_submit run_macro.job macro=MakeK0sPairHistograms
+#   condor_submit run_macro.job macro=StudyV0TopologyQA
+#   condor_submit run_macro.job macro=MakePromptHadronHistograms
+#   condor_submit run_macro.job macro=StudyPromptHadronTopologyQA
+Universe           = vanilla
+Initialdir         = /sphenix/user/mitrankova/TpcHadronReco/work
+Executable         = $(Initialdir)/run_macro.sh
+Arguments          = $(macro) $(InputFile)
+Output             = $(Initialdir)/log/$(macro)_$(Process).out
+Error              = $(Initialdir)/log/$(macro)_$(Process).err
+Log                = /tmp/$(macro)_$(Process).log
+PeriodicHold       = (NumJobStarts>=1 && JobStatus == 1)
+request_memory     = 4GB
+request_cpus       = 1
+Priority           = 20
+job_lease_duration = 3600
+Queue InputFile matching files /sphenix/tg/tg01/hf/mitrankova/Hadrons_FullRun/hadron_sitpc_HITS_pp_mvtxS300_79513_*.root

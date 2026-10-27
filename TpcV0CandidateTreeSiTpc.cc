@@ -10,6 +10,7 @@
 
 #include "TpcTrackHelixFitter.h"
 
+#include <sitrackreco/PairVertexFinder.h>
 #include <sitrackreco/SiTpc_Track.h>
 #include <sitrackreco/SiTpc_TrackContainer.h>
 
@@ -24,12 +25,16 @@
 #include <phool/phool.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
+#include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -308,6 +313,7 @@ namespace tpchadronreco
       tracklet.sitpc_z_rms = track->get_z_rms();
       tracklet.sitpc_tpc_z_offset = std::isfinite(track->get_tpc_z_offset()) ? track->get_tpc_z_offset() : 0.0;
       tracklet.sitpc_match_chi2 = track->get_match_chi2();
+      tracklet.sitpc_match_dphi = track->get_match_dphi();
 
       // ---- dE/dx from the TPC poly track
       const Tpc_PolyTrack *tpc_track = nullptr;
@@ -384,12 +390,12 @@ namespace tpchadronreco
       }
       tracklet.ntpc_clusters = n_tpc;
 
-      bool ok = false;
-      if (m_use_sitpc_native_helix)
+      // ---- helix of the combined fit (SiTpcTrackMatcher): circle (cx, cy, R, helicity) +
+      // z(s) = z0 + tanl s, s = transverse path from the pca.  TpcTrackHelix: z = z0_h + pitch * theta.
+      // Kept on every tracklet (D0 vertex, set_d0_use_sitpc_helix); it is the track model itself
+      // with set_track_fit_method("sitpc").
       {
-        // Helix of the combined fit: circle (cx, cy, R, helicity) + z(s) = z0 + tanl s,
-        // s = transverse path from the pca.  TpcTrackHelix: z = z0_h + pitch * theta.
-        HelixFit &helix = tracklet.helix;
+        HelixFit &helix = tracklet.sitpc_helix;
         const double direction = static_cast<double>(track->get_helicity());
         helix.cx = track->get_circle_x();
         helix.cy = track->get_circle_y();
@@ -419,7 +425,14 @@ namespace tpchadronreco
         helix.theta_last = theta_last;
         helix.theta_min = std::min(theta0, theta_last);
         helix.theta_max = std::max(theta0, theta_last);
-        tracklet.has_helix = TpcTrackHelixFitter::finite(helix_point(helix, theta0));
+        tracklet.has_sitpc_helix = TpcTrackHelixFitter::finite(helix_point(helix, theta0));
+      }
+
+      bool ok = false;
+      if (m_use_sitpc_native_helix)
+      {
+        tracklet.helix = tracklet.sitpc_helix;
+        tracklet.has_helix = tracklet.has_sitpc_helix;
         ok = tracklet.has_helix && finalize_sitpc_native_helix(tracklet);
       }
       else
@@ -430,6 +443,23 @@ namespace tpchadronreco
       {
         ++m_counter_sitpc_reject_fit;
         continue;
+      }
+      if (tracklet.has_sitpc_helix)
+      {
+        if (m_use_sitpc_native_helix)
+        {
+          tracklet.sitpc_helix_search_range = tracklet.helix_search_range;
+          tracklet.has_sitpc_helix_search_range = tracklet.has_helix_search_range;
+        }
+        else
+        {
+          tracklet.has_sitpc_helix_search_range =
+              TpcTrackHelixFitter::measurement_anchored_search_range(
+                  tracklet.sitpc_helix, tracklet.points,
+                  m_sitpc_helix_max_upstream_cm,
+                  m_sitpc_helix_downstream_margin_cm,
+                  tracklet.sitpc_helix_search_range);
+        }
       }
 
       tracklet.truth_momentum = tracklet.momentum;
@@ -864,5 +894,329 @@ namespace tpchadronreco
       return false;
     }
     return true;
+  }
+  // ------------------------------------------------------------------------
+  // D0 collision vertex: the SiTpc_VertexFinder vertex of both daughters, refitted without them
+  // ------------------------------------------------------------------------
+  struct TpcV0CandidateTree::D0VertexCache
+  {
+    struct Vertex
+    {
+      Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+      Eigen::Vector3d sigma{Eigen::Vector3d::Zero()};
+      unsigned int ntracks{0};
+      // models of the vertex tracks, built exactly as SiTpc_VertexFinder::collectSiTpc
+      // (perigee of the Si+TPC fit, track id = SiTpc_Track::get_id)
+      std::vector<PairVertexFinder::TrackModel> members;
+      bool complete{true};  // every vertex track found in SITPC_TRACKS
+    };
+    struct Refit
+    {
+      bool ok{false};
+      Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+      Eigen::Vector3d sigma{Eigen::Vector3d::Zero()};
+      unsigned int nused{0};
+    };
+    std::map<int, Vertex> vertices;  // SvtxVertexMap id (= Tracklet::collision_id)
+    // (vertex id, removed SiTpc ids) -> refit; one refit per daughter combination and event
+    std::map<std::tuple<int, unsigned int, unsigned int>, Refit> refits;
+  };
+
+  void TpcV0CandidateTree::build_d0_vertex_cache(const SiTpc_TrackContainer *sitpc_tracks,
+                                                 const SvtxVertexMap *vertex_map) const
+  {
+    if (!m_d0_cache)
+    {
+      m_d0_cache = std::make_shared<D0VertexCache>();
+    }
+    m_d0_cache->vertices.clear();
+    m_d0_cache->refits.clear();
+    if (!m_d0_vertex.enabled || !sitpc_tracks || !vertex_map)
+    {
+      return;
+    }
+
+    std::map<unsigned int, const SiTpc_Track *> by_id;
+    for (unsigned int itrack = 0; itrack < sitpc_tracks->size(); ++itrack)
+    {
+      const SiTpc_Track *track = sitpc_tracks->get_track(itrack);
+      if (track)
+      {
+        by_id[track->get_id()] = track;
+      }
+    }
+
+    for (auto iter = vertex_map->begin(); iter != vertex_map->end(); ++iter)
+    {
+      const SvtxVertex *vertex = iter->second;
+      if (!vertex)
+      {
+        continue;
+      }
+      D0VertexCache::Vertex v;
+      v.position = Eigen::Vector3d(vertex->get_x(), vertex->get_y(), vertex->get_z());
+      if (!v.position.allFinite())
+      {
+        continue;
+      }
+      v.sigma = Eigen::Vector3d(std::sqrt(std::max(0.0F, vertex->get_error(0, 0))),
+                                std::sqrt(std::max(0.0F, vertex->get_error(1, 1))),
+                                std::sqrt(std::max(0.0F, vertex->get_error(2, 2))));
+      v.ntracks = static_cast<unsigned int>(vertex->size_tracks());
+      for (auto it = vertex->begin_tracks(); it != vertex->end_tracks(); ++it)
+      {
+        const auto found = by_id.find(*it);
+        if (found == by_id.end())
+        {
+          v.complete = false;
+          continue;
+        }
+        const SiTpc_Track *t = found->second;
+        PairVertexFinder::TrackModel m;
+        if (!PairVertexFinder::fromPerigee(t->get_id(), t->get_pca_x(), t->get_pca_y(), t->get_z0(), t->get_phi(),
+                                           t->get_tanl(), t->get_circle_x(), t->get_circle_y(), t->get_radius(),
+                                           t->get_helicity(), t->get_pt(), m))
+        {
+          v.complete = false;
+          continue;
+        }
+        if (m.is_line && m.sigmaRPhi <= 0.0)
+        {
+          m.sigmaRPhi = 0.1;  // SiTpc_VertexFinder default line resolution
+          m.sigmaZ = 0.1;
+        }
+        v.members.push_back(m);
+      }
+      m_d0_cache->vertices[static_cast<int>(iter->first)] = std::move(v);
+    }
+  }
+
+  bool TpcV0CandidateTree::sitpc_helix_pca_to_xy(const Tracklet &tracklet, const Vec3 &vertex,
+                                                 Vec3 &pca, Vec3 &momentum) const
+  {
+    if (!tracklet.has_sitpc_helix || !(tracklet.sitpc_helix.radius > 0.0))
+    {
+      return false;
+    }
+    const HelixFit &helix = tracklet.sitpc_helix;
+    const double dx = vertex.x - helix.cx;
+    const double dy = vertex.y - helix.cy;
+    double theta = helix.theta_first;
+    if (std::hypot(dx, dy) > 1.0e-12)
+    {
+      const double raw = std::atan2(dy, dx);
+      theta = raw + kTwoPi * std::round((helix.theta_first - raw) / kTwoPi);  // the turn of the pca
+    }
+    pca = helix_point(helix, theta);
+    momentum = helix_momentum(helix, theta);
+    return finite(pca) && finite(momentum) && norm(momentum) > 0.0;
+  }
+
+  TpcV0CandidateTree::D0VertexInfo TpcV0CandidateTree::d0_collision_vertex(
+      const Tracklet &track1, const Tracklet &track2,
+      const Vec3 &pair_vertex,
+      const Vec3 &sv_mom1, const Vec3 &sv_mom2,
+      const double pair_dca, const bool have_secondary_pca) const
+  {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const Vec3 nan3{nan, nan, nan};
+    D0VertexInfo out;
+    out.vertex = out.sigma = nan3;
+    out.pca1 = out.pca2 = out.mom1 = out.mom2 = nan3;
+    out.sv = out.sv_mom1 = out.sv_mom2 = out.prompt_vertex = nan3;
+    out.dca1 = out.dca2 = {nan, nan};
+    out.pair_dca = nan;
+    out.displaced.signed_dca_xy1 = out.displaced.signed_dca_xy2 = out.displaced.dca_product = nan;
+    out.displaced.lxy = out.displaced.lxy_signed = out.displaced.decay_length = out.displaced.dira = nan;
+    out.displaced.pointing_dca_xy = out.displaced.pointing_dca_3d = nan;
+    const auto fail = [&out](const int status)
+    {
+      out.status = status;
+      out.ok = false;
+      return out;
+    };
+
+    // ---- 1. both daughters belong to one SiTpc_VertexFinder vertex
+    if (!m_d0_cache || !track1.has_si || !track2.has_si ||
+        !track1.has_collision_vertex || !track2.has_collision_vertex ||
+        track1.collision_vertex_source != 3 || track2.collision_vertex_source != 3 ||
+        track1.collision_id < 0 || track1.collision_id != track2.collision_id)
+    {
+      return fail(2);
+    }
+    const auto iv = m_d0_cache->vertices.find(track1.collision_id);
+    if (iv == m_d0_cache->vertices.end())
+    {
+      return fail(2);
+    }
+    const D0VertexCache::Vertex &vtx = iv->second;
+    out.ntracks = vtx.ntracks;
+    out.nused = vtx.ntracks;
+    out.vertex = {vtx.position.x(), vtx.position.y(), vtx.position.z()};
+    out.sigma = {vtx.sigma.x(), vtx.sigma.y(), vtx.sigma.z()};
+    if (vtx.ntracks < m_d0_vertex.min_vertex_tracks)
+    {
+      return fail(3);
+    }
+
+    // ---- 2. Si seeds of the daughters (as the SiTpc_VertexFinder track selection)
+    for (const Tracklet *track : {&track1, &track2})
+    {
+      if (track->n_mvtx < m_d0_vertex.min_mvtx ||
+          (m_d0_vertex.max_match_dphi > 0.0 &&
+           !(std::abs(track->sitpc_match_dphi) < m_d0_vertex.max_match_dphi)))
+      {
+        return fail(4);
+      }
+    }
+
+    // ---- 3. vertex without the daughters (same model, weights and outlier rejection as the finder)
+    if (m_d0_vertex.exclude_daughters)
+    {
+      std::vector<PairVertexFinder::TrackModel> others;
+      others.reserve(vtx.members.size());
+      std::vector<unsigned int> removed;
+      for (const auto &model : vtx.members)
+      {
+        if (model.track_id == track1.sitpc_id || model.track_id == track2.sitpc_id)
+        {
+          removed.push_back(model.track_id);
+          continue;
+        }
+        others.push_back(model);
+      }
+      out.nremoved = static_cast<unsigned int>(removed.size());
+      if (!removed.empty())
+      {
+        const unsigned int none = std::numeric_limits<unsigned int>::max();
+        const unsigned int id_a = removed.front();
+        const unsigned int id_b = removed.size() > 1 ? removed[1] : none;
+        const auto key = std::make_tuple(track1.collision_id, std::min(id_a, id_b), std::max(id_a, id_b));
+        auto ir = m_d0_cache->refits.find(key);
+        if (ir == m_d0_cache->refits.end())
+        {
+          D0VertexCache::Refit refit;
+          if (vtx.complete && others.size() >= m_d0_vertex.min_other_tracks)
+          {
+            PairVertexFinder::Config cfg;
+            cfg.sigmaRPhi = m_d0_vertex.sigma_rphi_cm;
+            cfg.sigmaZ = m_d0_vertex.sigma_z_cm;
+            cfg.msTerm = m_d0_vertex.ms_term;
+            cfg.maxTrackChi2 = m_d0_vertex.max_track_chi2;
+            cfg.useBeamSpotConstraint = m_d0_vertex.beam_constraint;
+            cfg.beamX = m_d0_vertex.beam_x_cm;
+            cfg.beamY = m_d0_vertex.beam_y_cm;
+            cfg.beamSigmaX = m_d0_vertex.beam_sigma_x_cm;
+            cfg.beamSigmaY = m_d0_vertex.beam_sigma_y_cm;
+            cfg.minTracksPerVertex = m_d0_vertex.min_other_tracks;
+            const PairVertexFinder finder(cfg);
+            const PairVertexFinder::VertexFit fit = finder.fit(others, vtx.position);
+            ++m_counter_d0v_refits;
+            if (fit.ok)
+            {
+              refit.ok = true;
+              refit.position = fit.position;
+              refit.sigma = Eigen::Vector3d(std::sqrt(std::max(0.0, fit.covariance(0, 0))),
+                                            std::sqrt(std::max(0.0, fit.covariance(1, 1))),
+                                            std::sqrt(std::max(0.0, fit.covariance(2, 2))));
+              refit.nused = static_cast<unsigned int>(fit.tracks.size());
+            }
+          }
+          ir = m_d0_cache->refits.emplace(key, refit).first;
+        }
+        if (!ir->second.ok)
+        {
+          return fail(5);
+        }
+        out.vertex = {ir->second.position.x(), ir->second.position.y(), ir->second.position.z()};
+        out.sigma = {ir->second.sigma.x(), ir->second.sigma.y(), ir->second.sigma.z()};
+        out.nused = ir->second.nused;
+      }
+    }
+
+    // ---- 4. vertex precision
+    if (m_d0_vertex.max_sigma_xy_cm > 0.0 &&
+        !(std::max(out.sigma.x, out.sigma.y) <= m_d0_vertex.max_sigma_xy_cm))
+    {
+      return fail(6);
+    }
+
+    // ---- 5. daughters at their PCA to the vertex, secondary vertex
+    bool ok1 = false;
+    bool ok2 = false;
+    if (m_d0_vertex.use_sitpc_helix)
+    {
+      ok1 = sitpc_helix_pca_to_xy(track1, out.vertex, out.pca1, out.mom1);
+      ok2 = sitpc_helix_pca_to_xy(track2, out.vertex, out.pca2, out.mom2);
+    }
+    else
+    {
+      double dca = nan;
+      ok1 = track_pca_to_xy(track1, out.vertex, out.pca1, dca, &out.mom1, nullptr) &&
+            finite(out.pca1) && finite(out.mom1) && norm(out.mom1) > 0.0;
+      ok2 = track_pca_to_xy(track2, out.vertex, out.pca2, dca, &out.mom2, nullptr) &&
+            finite(out.pca2) && finite(out.mom2) && norm(out.mom2) > 0.0;
+    }
+    if (!ok1 || !ok2)
+    {
+      return fail(7);
+    }
+
+    if (m_d0_vertex.use_sitpc_helix)
+    {
+      if (track1.has_sitpc_helix_search_range && track2.has_sitpc_helix_search_range)
+      {
+        const std::vector<HelixPca> candidates = TpcTrackHelixFitter::pca_candidates_in_ranges(
+            track1.sitpc_helix, track2.sitpc_helix,
+            track1.sitpc_helix_search_range, track2.sitpc_helix_search_range,
+            m_coarse_steps, m_pca_candidates);
+        if (!candidates.empty())
+        {
+          HelixPca best = candidates.front();
+          if (m_prefer_positive_pointing)
+          {
+            double best_score = std::numeric_limits<double>::max();
+            for (const auto &candidate : candidates)
+            {
+              const Vec3 vertex = scale(add(candidate.pca1, candidate.pca2), 0.5);
+              const Vec3 total = add(helix_momentum(track1.sitpc_helix, candidate.theta1),
+                                     helix_momentum(track2.sitpc_helix, candidate.theta2));
+              const double cos_theta = vector_cosine(subtract(vertex, out.vertex), total);
+              const double penalty = (std::isfinite(cos_theta) && cos_theta > 0.0) ? 0.0 : 1000.0;
+              const double score = penalty + candidate.dca - 1.0e-3 * cos_theta;
+              if (score < best_score)
+              {
+                best_score = score;
+                best = candidate;
+              }
+            }
+          }
+          out.sv = scale(add(best.pca1, best.pca2), 0.5);
+          out.sv_mom1 = helix_momentum(track1.sitpc_helix, best.theta1);
+          out.sv_mom2 = helix_momentum(track2.sitpc_helix, best.theta2);
+          out.pair_dca = best.dca;
+          out.have_sv = finite(out.sv) && finite(out.sv_mom1) && finite(out.sv_mom2);
+        }
+      }
+    }
+    else if (have_secondary_pca)
+    {
+      out.sv = pair_vertex;
+      out.sv_mom1 = sv_mom1;
+      out.sv_mom2 = sv_mom2;
+      out.pair_dca = pair_dca;
+      out.have_sv = finite(out.sv) && finite(out.sv_mom1) && finite(out.sv_mom2);
+    }
+
+    out.prompt_vertex = out.have_sv ? out.sv : scale(add(out.pca1, out.pca2), 0.5);
+    const Vec3 total = out.have_sv ? add(out.sv_mom1, out.sv_mom2) : add(out.mom1, out.mom2);
+    out.displaced = displaced_pair(out.prompt_vertex, total, out.vertex,
+                                   out.pca1, out.mom1, out.pca2, out.mom2, true);
+    out.displaced.valid = out.displaced.valid && out.have_sv;
+    out.dca1 = {out.displaced.signed_dca_xy1, out.pca1.z - out.vertex.z};
+    out.dca2 = {out.displaced.signed_dca_xy2, out.pca2.z - out.vertex.z};
+    out.status = 1;
+    out.ok = true;
+    return out;
   }
 }  // namespace tpchadronreco

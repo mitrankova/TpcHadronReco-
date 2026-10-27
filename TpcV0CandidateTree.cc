@@ -797,6 +797,23 @@ namespace tpchadronreco
                 << ", unmatched TPC tracks " << (m_sitpc_add_unmatched_tpc_tracks ? "on" : "off")
                 << ", D0 displaced selection " << (m_d0_displaced_cuts.enabled ? "on" : "off")
                 << ")" << std::endl;
+      if (m_d0_vertex.enabled)
+      {
+        if (m_sitpc_vertex_mode != SiTpcVertexMode::Map)
+        {
+          std::cerr << PHWHERE << Name()
+                    << ": set_d0_collision_vertex needs set_sitpc_vertex_mode(\"map\"); no D0 candidates will pass" << std::endl;
+        }
+        std::cout << Name() << ": D0 collision vertex: >= " << m_d0_vertex.min_vertex_tracks << " tracks in the "
+                  << m_sitpc_vertex_map_node << " vertex of both daughters"
+                  << (m_d0_vertex.exclude_daughters ? ", refitted without the daughters (>= " + std::to_string(m_d0_vertex.min_other_tracks) + " other tracks)" : std::string(", daughters kept"))
+                  << ", refit sigma rphi " << m_d0_vertex.sigma_rphi_cm << " cm, z " << m_d0_vertex.sigma_z_cm
+                  << " cm, ms " << m_d0_vertex.ms_term << " cm GeV, chi2 < " << m_d0_vertex.max_track_chi2
+                  << (m_d0_vertex.beam_constraint ? ", beam (" + std::to_string(m_d0_vertex.beam_x_cm) + ", " + std::to_string(m_d0_vertex.beam_y_cm) + ") +- (" + std::to_string(m_d0_vertex.beam_sigma_x_cm) + ", " + std::to_string(m_d0_vertex.beam_sigma_y_cm) + ") cm" : std::string(", no beam constraint"))
+                  << (m_d0_vertex.max_sigma_xy_cm > 0.0 ? ", vertex xy error < " + std::to_string(m_d0_vertex.max_sigma_xy_cm) + " cm" : std::string())
+                  << "; daughters >= " << m_d0_vertex.min_mvtx << " MVTX, |match dphi| < " << m_d0_vertex.max_match_dphi
+                  << " rad; D0 track model " << (m_d0_vertex.use_sitpc_helix ? "matcher helix" : "track fit") << std::endl;
+      }
     }
     if (m_fit_kalman_tracks && m_fit_acts_tracks)
     {
@@ -922,6 +939,10 @@ namespace tpchadronreco
         }
       }
       assign_sitpc_collision_vertices(tracklet_map, vertex_map);
+      if (m_d0_vertex.enabled)
+      {
+        build_d0_vertex_cache(sitpc_tracks, vertex_map);
+      }
     }
     else if (m_use_pattern_cluster_tracks)
     {
@@ -1242,6 +1263,17 @@ namespace tpchadronreco
                   << m_counter_sitpc_vertex_tracks << "/" << m_counter_sitpc_vertex_fixed
                   << " (map: attached by nearest z " << m_counter_sitpc_vertex_map_attached << ")"
                   << std::endl;
+        if (m_d0_vertex.enabled)
+        {
+          const auto &c = m_counter_d0v_status;
+          std::cout << Name() << ": D0 collision vertex (>= " << m_d0_vertex.min_vertex_tracks << " vertex tracks"
+                    << (m_d0_vertex.exclude_daughters ? ", refitted without the daughters, >= " + std::to_string(m_d0_vertex.min_other_tracks) + " others" : std::string())
+                    << ", daughters >= " << m_d0_vertex.min_mvtx << " MVTX, |match dphi| < " << m_d0_vertex.max_match_dphi
+                    << (m_d0_vertex.use_sitpc_helix ? ", matcher helix" : ", refit tracks") << "): pairs ok " << c[1]
+                    << ", no common vertex " << c[2] << ", too few vertex tracks " << c[3] << ", daughter Si " << c[4]
+                    << ", refit failed " << c[5] << ", vertex error " << c[6] << ", daughter PCA " << c[7]
+                    << "; refits " << m_counter_d0v_refits << std::endl;
+        }
       }
       if (m_pair_tree)
       {
@@ -3004,6 +3036,93 @@ namespace tpchadronreco
                             m_pair.mass_AntiLambda, pair_dca, cos_theta});
       }
     }
+    // ---- D0 collision vertex (set_d0_collision_vertex): the SiTpc_VertexFinder vertex of both
+    // daughters refitted without them, daughters and secondary vertex from the matcher helix
+    // (evaluated only for pairs with a D0 or anti-D0 mass inside the D0 mass windows: the refit and
+    // the helix-helix PCA are not needed for the other pairs)
+    const bool d0_vertex_mode =
+        m_use_sitpc_tracks && m_d0_vertex.enabled && (m_d0_cuts.enabled || m_antid0_cuts.enabled) &&
+        (!same_sign || m_write_likesign_d0);
+    bool d0_mass_candidate = false;
+    if (d0_vertex_mode)
+    {
+      const auto inside = [](const SpeciesCuts &cuts, const double mass)
+      {
+        return cuts.enabled && std::isfinite(mass) &&
+               (cuts.mass_min < 0.0 || mass >= cuts.mass_min) &&
+               (cuts.mass_max < 0.0 || mass <= cuts.mass_max);
+      };
+      for (const double mass : {static_cast<double>(m_pair.mass_D0), static_cast<double>(m_pair.mass_D0_primary_constrained),
+                                static_cast<double>(m_pair.mass_K1Pi2), static_cast<double>(m_pair.mass_K1Pi2_primary_constrained)})
+      {
+        d0_mass_candidate = d0_mass_candidate || inside(m_d0_cuts, mass);
+      }
+      for (const double mass : {static_cast<double>(m_pair.mass_AntiD0), static_cast<double>(m_pair.mass_AntiD0_primary_constrained),
+                                static_cast<double>(m_pair.mass_Pi1K2), static_cast<double>(m_pair.mass_Pi1K2_primary_constrained)})
+      {
+        d0_mass_candidate = d0_mass_candidate || inside(m_antid0_cuts, mass);
+      }
+    }
+    D0VertexInfo d0v;
+    if (d0_vertex_mode && d0_mass_candidate)
+    {
+      d0v = d0_collision_vertex(track1, track2, pair_vertex, secondary_mom1, secondary_mom2,
+                                pair_dca, have_secondary_pca);
+      ++m_counter_d0v_status[static_cast<std::size_t>(std::clamp(d0v.status, 0, 7))];
+      m_pair.d0v_status = d0v.status;
+      m_pair.d0v_ntracks = d0v.ntracks;
+      m_pair.d0v_nused = d0v.nused;
+      m_pair.d0v_nremoved = d0v.nremoved;
+      m_pair.d0v_x = static_cast<float>(d0v.vertex.x);
+      m_pair.d0v_y = static_cast<float>(d0v.vertex.y);
+      m_pair.d0v_z = static_cast<float>(d0v.vertex.z);
+      m_pair.d0v_ex = static_cast<float>(d0v.sigma.x);
+      m_pair.d0v_ey = static_cast<float>(d0v.sigma.y);
+      m_pair.d0v_ez = static_cast<float>(d0v.sigma.z);
+      if (track1.has_si)
+      {
+        m_pair.d0v_match_dphi1 = static_cast<float>(track1.sitpc_match_dphi);
+      }
+      if (track2.has_si)
+      {
+        m_pair.d0v_match_dphi2 = static_cast<float>(track2.sitpc_match_dphi);
+      }
+      if (d0v.ok)
+      {
+        m_pair.d0v_dca_xy1 = static_cast<float>(d0v.dca1.first);
+        m_pair.d0v_dca_xy2 = static_cast<float>(d0v.dca2.first);
+        m_pair.d0v_dca_z1 = static_cast<float>(d0v.dca1.second);
+        m_pair.d0v_dca_z2 = static_cast<float>(d0v.dca2.second);
+        m_pair.d0v_dca_product = static_cast<float>(d0v.displaced.dca_product);
+        if (d0v.have_sv)
+        {
+          m_pair.d0v_pair_dca = static_cast<float>(d0v.pair_dca);
+          m_pair.d0v_sv_x = static_cast<float>(d0v.sv.x);
+          m_pair.d0v_sv_y = static_cast<float>(d0v.sv.y);
+          m_pair.d0v_sv_z = static_cast<float>(d0v.sv.z);
+          const Vec3 &sv_pos = track1.charge > 0 ? d0v.sv_mom1 : d0v.sv_mom2;
+          const Vec3 &sv_neg = track1.charge > 0 ? d0v.sv_mom2 : d0v.sv_mom1;
+          m_pair.d0v_mass_D0_sv = static_cast<float>(invariant_mass(sv_neg, kKaonMass, sv_pos, kPionMass));
+          m_pair.d0v_mass_AntiD0_sv = static_cast<float>(invariant_mass(sv_pos, kKaonMass, sv_neg, kPionMass));
+        }
+        if (d0v.displaced.valid)
+        {
+          m_pair.d0v_lxy = static_cast<float>(d0v.displaced.lxy);
+          m_pair.d0v_lxy_signed = static_cast<float>(d0v.displaced.lxy_signed);
+          m_pair.d0v_decay_length = static_cast<float>(d0v.displaced.decay_length);
+          m_pair.d0v_dira = static_cast<float>(d0v.displaced.dira);
+          m_pair.d0v_pointing_dca_xy = static_cast<float>(d0v.displaced.pointing_dca_xy);
+          m_pair.d0v_pointing_dca_3d = static_cast<float>(d0v.displaced.pointing_dca_3d);
+        }
+      }
+    }
+    // D0 hypothesis: prompt-style species cuts (mass, pT, |DCA|, ...) and the displaced selection,
+    // with the D0 vertex and the D0 track model in d0_vertex_mode
+    const bool pass_d0_displaced_final =
+        d0_vertex_mode
+            ? (d0v.ok && passes_d0_displaced_selection(d0v.displaced, d0v.dca1, d0v.dca2, d0v.pair_dca))
+            : pass_d0_displaced;
+
     const bool use_constrained_phi_kinematics =
         m_use_constrained_phi_selection && have_primary_constrained_pair &&
         std::isfinite(m_pair.mass_Phi_primary_constrained);
@@ -3076,50 +3195,33 @@ namespace tpchadronreco
             nan,
             m_pair.mass_Jpsi,
             false);
-    const bool pass_d0 =
-        have_primary_pair &&
-        passes_species_selection(
-            m_d0_cuts,
-            track1,
-            track2,
-            prompt_selection_pca1,
-            prompt_selection_pca2,
-            prompt_selection_vertex,
-            primary_vertex,
-            primary_pca1,
-            primary_pca2,
-            d0_selection_mom1,
-            d0_selection_mom2,
-            have_primary_pair,
-            dca1,
-            dca2,
-            prompt_selection_pair_dca,
-            nan,
-            nan,
-            d0_selection_mass,
-            false);
-    const bool pass_antid0 =
-        have_primary_pair &&
-        passes_species_selection(
-            m_antid0_cuts,
-            track1,
-            track2,
-            prompt_selection_pca1,
-            prompt_selection_pca2,
-            prompt_selection_vertex,
-            primary_vertex,
-            primary_pca1,
-            primary_pca2,
-            d0_selection_mom1,
-            d0_selection_mom2,
-            have_primary_pair,
-            dca1,
-            dca2,
-            prompt_selection_pair_dca,
-            nan,
-            nan,
-            antid0_selection_mass,
-            false);
+    const auto passes_d0_hypothesis = [&](const SpeciesCuts &cuts, const double mass) -> bool
+    {
+      if (!have_primary_pair)
+      {
+        return false;
+      }
+      if (!d0_vertex_mode)
+      {
+        return passes_species_selection(
+            cuts, track1, track2,
+            prompt_selection_pca1, prompt_selection_pca2, prompt_selection_vertex,
+            primary_vertex, primary_pca1, primary_pca2, d0_selection_mom1, d0_selection_mom2,
+            have_primary_pair, dca1, dca2, prompt_selection_pair_dca,
+            nan, nan, mass, false);
+      }
+      // pT and mass: momenta of the track fit (d0_selection_mom); DCAs, PCA z, pair DCA and flight
+      // length: D0 vertex and D0 track model
+      return d0v.ok &&
+             passes_species_selection(
+                 cuts, track1, track2,
+                 d0v.pca1, d0v.pca2, d0v.prompt_vertex,
+                 d0v.vertex, d0v.pca1, d0v.pca2, d0_selection_mom1, d0_selection_mom2,
+                 true, d0v.dca1, d0v.dca2, d0v.pair_dca,
+                 nan, nan, mass, false);
+    };
+    const bool pass_d0 = passes_d0_hypothesis(m_d0_cuts, d0_selection_mass);
+    const bool pass_antid0 = passes_d0_hypothesis(m_antid0_cuts, antid0_selection_mass);
 
     if (same_sign)
     {
@@ -3177,20 +3279,10 @@ namespace tpchadronreco
              std::isfinite(m_pair.mass_Pi1K2_primary_constrained))
                 ? m_pair.mass_Pi1K2_primary_constrained
                 : m_pair.mass_Pi1K2;
-        const bool pass_k1pi2 = passes_species_selection(
-            m_d0_cuts, track1, track2,
-            prompt_selection_pca1, prompt_selection_pca2, prompt_selection_vertex,
-            primary_vertex, primary_pca1, primary_pca2, d0_selection_mom1, d0_selection_mom2,
-            have_primary_pair, dca1, dca2, prompt_selection_pair_dca,
-            nan, nan, k1pi2_selection_mass, false);
-        const bool pass_pi1k2 = passes_species_selection(
-            m_antid0_cuts, track1, track2,
-            prompt_selection_pca1, prompt_selection_pca2, prompt_selection_vertex,
-            primary_vertex, primary_pca1, primary_pca2, d0_selection_mom1, d0_selection_mom2,
-            have_primary_pair, dca1, dca2, prompt_selection_pair_dca,
-            nan, nan, pi1k2_selection_mass, false);
-        if (pass_k1pi2 && pass_d0_displaced) m_pair.candidate_mask |= CandidateD0;
-        if (pass_pi1k2 && pass_d0_displaced) m_pair.candidate_mask |= CandidateAntiD0;
+        const bool pass_k1pi2 = passes_d0_hypothesis(m_d0_cuts, k1pi2_selection_mass);
+        const bool pass_pi1k2 = passes_d0_hypothesis(m_antid0_cuts, pi1k2_selection_mass);
+        if (pass_k1pi2 && pass_d0_displaced_final) m_pair.candidate_mask |= CandidateD0;
+        if (pass_pi1k2 && pass_d0_displaced_final) m_pair.candidate_mask |= CandidateAntiD0;
       }
     }
     else
@@ -3200,8 +3292,8 @@ namespace tpchadronreco
       if (pass_antilambda) m_pair.candidate_mask |= CandidateAntiLambda;
       if (pass_phi) m_pair.candidate_mask |= CandidatePhi;
       if (pass_jpsi) m_pair.candidate_mask |= CandidateJpsi;
-      if (pass_d0 && pass_d0_displaced) m_pair.candidate_mask |= CandidateD0;
-      if (pass_antid0 && pass_d0_displaced) m_pair.candidate_mask |= CandidateAntiD0;
+      if (pass_d0 && pass_d0_displaced_final) m_pair.candidate_mask |= CandidateD0;
+      if (pass_antid0 && pass_d0_displaced_final) m_pair.candidate_mask |= CandidateAntiD0;
     }
 
     if (m_pair.candidate_mask == 0U)
@@ -3335,7 +3427,10 @@ namespace tpchadronreco
           invariant_mass(secondary_mom1, kKaonMass, secondary_mom2, kKaonMass));
     }
     m_pair.d0_displaced_mask =
-        (displaced.valid && pass_d0_displaced) ? 0x3 : 0;
+        (d0_vertex_mode ? (d0v.displaced.valid && pass_d0_displaced_final)
+                        : (displaced.valid && pass_d0_displaced))
+            ? 0x3
+            : 0;
 
     const bool keep_kshort_details =
         m_write_kshort_daughter_details && pass_kshort &&
@@ -4992,6 +5087,31 @@ namespace tpchadronreco
     m_pair.mass_D0_sv = nan;
     m_pair.mass_AntiD0_sv = nan;
     m_pair.mass_Phi_sv = nan;
+    m_pair.d0v_x = nan;
+    m_pair.d0v_y = nan;
+    m_pair.d0v_z = nan;
+    m_pair.d0v_ex = nan;
+    m_pair.d0v_ey = nan;
+    m_pair.d0v_ez = nan;
+    m_pair.d0v_match_dphi1 = nan;
+    m_pair.d0v_match_dphi2 = nan;
+    m_pair.d0v_dca_xy1 = nan;
+    m_pair.d0v_dca_xy2 = nan;
+    m_pair.d0v_dca_z1 = nan;
+    m_pair.d0v_dca_z2 = nan;
+    m_pair.d0v_dca_product = nan;
+    m_pair.d0v_pair_dca = nan;
+    m_pair.d0v_sv_x = nan;
+    m_pair.d0v_sv_y = nan;
+    m_pair.d0v_sv_z = nan;
+    m_pair.d0v_lxy = nan;
+    m_pair.d0v_lxy_signed = nan;
+    m_pair.d0v_decay_length = nan;
+    m_pair.d0v_dira = nan;
+    m_pair.d0v_pointing_dca_xy = nan;
+    m_pair.d0v_pointing_dca_3d = nan;
+    m_pair.d0v_mass_D0_sv = nan;
+    m_pair.d0v_mass_AntiD0_sv = nan;
     m_pair.primary_px1 = nan;
     m_pair.primary_py1 = nan;
     m_pair.primary_pz1 = nan;
@@ -5448,6 +5568,36 @@ namespace tpchadronreco
     tree->Branch("mass_AntiD0_sv", &m_pair.mass_AntiD0_sv, "mass_AntiD0_sv/F");
     tree->Branch("mass_Phi_sv", &m_pair.mass_Phi_sv, "mass_Phi_sv/F");
     tree->Branch("d0_displaced_mask", &m_pair.d0_displaced_mask, "d0_displaced_mask/I");
+    // D0 collision vertex (set_d0_collision_vertex)
+    tree->Branch("d0v_status", &m_pair.d0v_status, "d0v_status/I");
+    tree->Branch("d0v_ntracks", &m_pair.d0v_ntracks, "d0v_ntracks/i");
+    tree->Branch("d0v_nused", &m_pair.d0v_nused, "d0v_nused/i");
+    tree->Branch("d0v_nremoved", &m_pair.d0v_nremoved, "d0v_nremoved/i");
+    tree->Branch("d0v_x", &m_pair.d0v_x, "d0v_x/F");
+    tree->Branch("d0v_y", &m_pair.d0v_y, "d0v_y/F");
+    tree->Branch("d0v_z", &m_pair.d0v_z, "d0v_z/F");
+    tree->Branch("d0v_ex", &m_pair.d0v_ex, "d0v_ex/F");
+    tree->Branch("d0v_ey", &m_pair.d0v_ey, "d0v_ey/F");
+    tree->Branch("d0v_ez", &m_pair.d0v_ez, "d0v_ez/F");
+    tree->Branch("d0v_match_dphi1", &m_pair.d0v_match_dphi1, "d0v_match_dphi1/F");
+    tree->Branch("d0v_match_dphi2", &m_pair.d0v_match_dphi2, "d0v_match_dphi2/F");
+    tree->Branch("d0v_dca_xy1", &m_pair.d0v_dca_xy1, "d0v_dca_xy1/F");
+    tree->Branch("d0v_dca_xy2", &m_pair.d0v_dca_xy2, "d0v_dca_xy2/F");
+    tree->Branch("d0v_dca_z1", &m_pair.d0v_dca_z1, "d0v_dca_z1/F");
+    tree->Branch("d0v_dca_z2", &m_pair.d0v_dca_z2, "d0v_dca_z2/F");
+    tree->Branch("d0v_dca_product", &m_pair.d0v_dca_product, "d0v_dca_product/F");
+    tree->Branch("d0v_pair_dca", &m_pair.d0v_pair_dca, "d0v_pair_dca/F");
+    tree->Branch("d0v_sv_x", &m_pair.d0v_sv_x, "d0v_sv_x/F");
+    tree->Branch("d0v_sv_y", &m_pair.d0v_sv_y, "d0v_sv_y/F");
+    tree->Branch("d0v_sv_z", &m_pair.d0v_sv_z, "d0v_sv_z/F");
+    tree->Branch("d0v_lxy", &m_pair.d0v_lxy, "d0v_lxy/F");
+    tree->Branch("d0v_lxy_signed", &m_pair.d0v_lxy_signed, "d0v_lxy_signed/F");
+    tree->Branch("d0v_decay_length", &m_pair.d0v_decay_length, "d0v_decay_length/F");
+    tree->Branch("d0v_dira", &m_pair.d0v_dira, "d0v_dira/F");
+    tree->Branch("d0v_pointing_dca_xy", &m_pair.d0v_pointing_dca_xy, "d0v_pointing_dca_xy/F");
+    tree->Branch("d0v_pointing_dca_3d", &m_pair.d0v_pointing_dca_3d, "d0v_pointing_dca_3d/F");
+    tree->Branch("d0v_mass_D0_sv", &m_pair.d0v_mass_D0_sv, "d0v_mass_D0_sv/F");
+    tree->Branch("d0v_mass_AntiD0_sv", &m_pair.d0v_mass_AntiD0_sv, "d0v_mass_AntiD0_sv/F");
     tree->Branch("has_kshort_daughter_details",
                  &m_pair.has_kshort_daughter_details,
                  "has_kshort_daughter_details/I");

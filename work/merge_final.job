@@ -1,0 +1,13 @@
+# Step 2 (after all step-1 jobs are done): one job per macro merging its ~40 group files.
+#   condor_submit merge_final.job
+Universe           = vanilla
+Initialdir         = /sphenix/user/mitrankova/TpcHadronReco/work
+Executable         = $(Initialdir)/merge_job.sh
+Arguments          = $(macro) final
+Output             = $(Initialdir)/log/merge_final_$(macro).out
+Error              = $(Initialdir)/log/merge_final_$(macro).err
+Log                = /tmp/merge_final_$(macro).log
+request_memory     = 6GB
+request_cpus       = 1
+Priority           = 20
+Queue macro in (MakeK0sPairHistograms StudyV0TopologyQA MakePromptHadronHistograms StudyPromptHadronTopologyQA)

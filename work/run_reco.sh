@@ -18,7 +18,7 @@ nEvents="$1"
 runnumber=79513
 collision="run3pp"
 cdbtag="ana561_2025p013_v001"
-OutDir=/sphenix/tg/tg01/hf/mitrankova/Hadrons
+OutDir=/sphenix/tg/tg01/hf/mitrankova/Hadrons_FullRun
 name="HITS_pp"
 
 #runnumber=76905
@@ -51,7 +51,7 @@ segment="$2"
 nSkip="$3"
 
 echo ========================================================
-echo Running Fun4All_raw_hit_Poly_reco_pp_V0.C
+echo Running Fun4All_raw_hit_Poly_reco_pp_V0_ELscan.C
 echo "  nEvents             = ${nEvents}"
 echo "  nSkip               = ${nSkip}"
 echo "  Run Number          = ${runnumber}"
@@ -64,7 +64,7 @@ echo ========================================================
 
 
  root.exe -l -b << EOF
-        .x Fun4All_raw_hit_Poly_reco_pp_V0.C(${nEvents},${runnumber}, ${segment},"${OutDir}",${nSkip},"${collision}","${cdbtag}","${name}")
+        .x Fun4All_raw_hit_Poly_reco_pp_V0_hybrid.C(${nEvents},${runnumber}, ${segment},"${OutDir}",${nSkip},"${collision}","${cdbtag}","${name}")
 EOF
 
 echo all done

@@ -7,6 +7,8 @@
 
 #include <fun4all/SubsysReco.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -164,6 +166,61 @@ namespace tpchadronreco
       m_sitpc_helix_max_upstream_cm = max_upstream_cm;
       m_sitpc_helix_downstream_margin_cm = downstream_margin_cm;
     }
+
+    // ---- D0 collision vertex (Si+TPC tracks, set_sitpc_vertex_mode("map"))
+    // D0 / anti-D0 candidates (pairTree and likeSignPairTree) only from collisions with a
+    // SiTpc_VertexFinder vertex (SiTpcPolyVertexMap) of >= min_vertex_tracks tracks to which BOTH
+    // daughters belong (fitted in it or attached to it by z).  The D0 cuts, the d0v_* branches
+    // and the displaced selection use that vertex:
+    //   exclude_daughters: daughters that are in the vertex are removed and the vertex is refitted
+    //     with its other tracks (unbiased by the D0 decay length), same track model and weights as
+    //     SiTpc_VertexFinder (set_d0_vertex_refit); >= min_other_tracks other tracks required
+    //   max_vertex_sigma_xy_cm: max(sqrt(cov_xx), sqrt(cov_yy)) of that vertex (< 0: no cut)
+    // Requires the SiTpc_VertexFinder track model "from the Si+TPC fit"
+    // (setSiTpcPositionFromSi(false), the hybrid xy setup).
+    void set_d0_collision_vertex(const bool enabled,
+                                 const unsigned int min_vertex_tracks = 4,
+                                 const bool exclude_daughters = true,
+                                 const unsigned int min_other_tracks = 2,
+                                 const double max_vertex_sigma_xy_cm = -1.0)
+    {
+      m_d0_vertex.enabled = enabled;
+      m_d0_vertex.min_vertex_tracks = min_vertex_tracks;
+      m_d0_vertex.exclude_daughters = exclude_daughters;
+      m_d0_vertex.min_other_tracks = std::max(2U, min_other_tracks);
+      m_d0_vertex.max_sigma_xy_cm = max_vertex_sigma_xy_cm;
+    }
+    // Fit settings of SiTpc_VertexFinder (SiTpcVertexFinder in the macro) for the refit without the
+    // daughters: setTrackResolution(sigma_rphi, sigma_z), setMultipleScatteringTerm(ms),
+    // setMaxTrackChi2, setUseBeamSpotConstraint, setBeamSpot, setBeamSpotSigma.
+    void set_d0_vertex_refit(const double sigma_rphi_cm, const double sigma_z_cm,
+                             const double ms_term_cm_gev, const double max_track_chi2,
+                             const bool beam_constraint,
+                             const double beam_x_cm, const double beam_y_cm,
+                             const double beam_sigma_x_cm, const double beam_sigma_y_cm)
+    {
+      m_d0_vertex.sigma_rphi_cm = sigma_rphi_cm;
+      m_d0_vertex.sigma_z_cm = sigma_z_cm;
+      m_d0_vertex.ms_term = ms_term_cm_gev;
+      m_d0_vertex.max_track_chi2 = max_track_chi2;
+      m_d0_vertex.beam_constraint = beam_constraint;
+      m_d0_vertex.beam_x_cm = beam_x_cm;
+      m_d0_vertex.beam_y_cm = beam_y_cm;
+      m_d0_vertex.beam_sigma_x_cm = beam_sigma_x_cm;
+      m_d0_vertex.beam_sigma_y_cm = beam_sigma_y_cm;
+    }
+    // D0 daughters: Si seed quality, >= min_mvtx MVTX points and |phi_Si - phi_TPC| of the Si-TPC
+    // match < max_match_dphi [rad] (<= 0: no cut).  Same as the SiTpc_VertexFinder track selection.
+    void set_d0_daughter_si_selection(const unsigned int min_mvtx, const double max_match_dphi)
+    {
+      m_d0_vertex.min_mvtx = min_mvtx;
+      m_d0_vertex.max_match_dphi = max_match_dphi;
+    }
+    // true (default): daughter impact parameters, secondary vertex (helix-helix PCA), Lxy, DIRA and
+    // pointing of the D0 from the SiTpcTrackMatcher helix (hybrid xy: circle centre from the Si
+    // points, TPC curvature = the DCA_xy of plot_dca_xy.C) instead of the refit of
+    // set_track_fit_method.  The masses and pT cuts keep the momenta of the refit.
+    void set_d0_use_sitpc_helix(const bool value = true) { m_d0_vertex.use_sitpc_helix = value; }
 
     // Displaced-vertex D0 / anti-D0 selection.  It is applied ON TOP of
     // set_d0_selection / set_antid0_selection (mass window and prompt cuts),
@@ -686,6 +743,13 @@ namespace tpchadronreco
       double sitpc_z_rms{0.0};
       double sitpc_tpc_z_offset{0.0};
       double sitpc_match_chi2{0.0};
+      double sitpc_match_dphi{0.0};  // phi_Si - phi_TPC of the Si-TPC match [rad]
+      // the SiTpcTrackMatcher helix (= helix with set_track_fit_method("sitpc")), kept for the D0
+      // vertex also when the tracks are refitted
+      bool has_sitpc_helix{false};
+      HelixFit sitpc_helix;
+      bool has_sitpc_helix_search_range{false};
+      HelixSearchRange sitpc_helix_search_range;
       unsigned char crossing_tier{255};
       double si_vertex_z{0.0};
       bool has_si_vertex_z{false};
@@ -1191,6 +1255,40 @@ namespace tpchadronreco
       float mass_Phi_sv{0.0F};
       int d0_displaced_mask{0};  // bit 0: D0, bit 1: anti-D0 passed the displaced selection
 
+      // ---- D0 collision vertex (set_d0_collision_vertex), NaN / 0 when not evaluated
+      // d0v_status: 0 not evaluated, 1 ok, 2 no common SiTpcPolyVertexMap vertex, 3 vertex with too
+      // few tracks, 4 daughter Si quality, 5 refit without the daughters failed / too few other
+      // tracks, 6 vertex error too large, 7 daughter PCA to the vertex failed
+      int d0v_status{0};
+      float d0v_x{0.0F};
+      float d0v_y{0.0F};
+      float d0v_z{0.0F};
+      float d0v_ex{0.0F};
+      float d0v_ey{0.0F};
+      float d0v_ez{0.0F};
+      unsigned int d0v_ntracks{0};  // tracks of the SiTpc_VertexFinder vertex
+      unsigned int d0v_nused{0};    // tracks of the vertex used here (refit: without the daughters)
+      unsigned int d0v_nremoved{0};  // daughters removed from the vertex (0, 1, 2)
+      float d0v_match_dphi1{0.0F};
+      float d0v_match_dphi2{0.0F};
+      float d0v_dca_xy1{0.0F};  // signed DCA_xy of the daughters to the D0 vertex [cm]
+      float d0v_dca_xy2{0.0F};
+      float d0v_dca_z1{0.0F};   // z(PCA_xy) - vertex z [cm]
+      float d0v_dca_z2{0.0F};
+      float d0v_dca_product{0.0F};
+      float d0v_pair_dca{0.0F};
+      float d0v_sv_x{0.0F};  // secondary vertex (daughter-daughter PCA midpoint)
+      float d0v_sv_y{0.0F};
+      float d0v_sv_z{0.0F};
+      float d0v_lxy{0.0F};
+      float d0v_lxy_signed{0.0F};
+      float d0v_decay_length{0.0F};
+      float d0v_dira{0.0F};
+      float d0v_pointing_dca_xy{0.0F};
+      float d0v_pointing_dca_3d{0.0F};
+      float d0v_mass_D0_sv{0.0F};  // momenta at the secondary vertex of the D0 track model
+      float d0v_mass_AntiD0_sv{0.0F};
+
       int has_kshort_daughter_details{0};
       DaughterDetailRow daughter1;
       DaughterDetailRow daughter2;
@@ -1414,6 +1512,42 @@ namespace tpchadronreco
                                        const std::pair<double, double> &dca1,
                                        const std::pair<double, double> &dca2,
                                        double pair_dca) const;
+
+    // ---- D0 collision vertex (set_d0_collision_vertex, TpcV0CandidateTreeSiTpc.cc)
+    struct D0VertexInfo
+    {
+      int status{0};  // see PairRow::d0v_status
+      bool ok{false};
+      Vec3 vertex;
+      Vec3 sigma;
+      unsigned int ntracks{0};
+      unsigned int nused{0};
+      unsigned int nremoved{0};
+      // daughters at their transverse PCA to the D0 vertex
+      Vec3 pca1;
+      Vec3 pca2;
+      Vec3 mom1;
+      Vec3 mom2;
+      std::pair<double, double> dca1;  // (signed DCA_xy, dz)
+      std::pair<double, double> dca2;
+      // secondary vertex
+      bool have_sv{false};
+      Vec3 sv;
+      Vec3 sv_mom1;
+      Vec3 sv_mom2;
+      double pair_dca{0.0};
+      Vec3 prompt_vertex;  // pair vertex used by the prompt-species cuts (flight length)
+      DisplacedPair displaced;
+    };
+    struct D0VertexCache;  // members of the SiTpcPolyVertexMap vertices of this event
+    void build_d0_vertex_cache(const SiTpc_TrackContainer *sitpc_tracks,
+                               const SvtxVertexMap *vertex_map) const;
+    D0VertexInfo d0_collision_vertex(const Tracklet &track1, const Tracklet &track2,
+                                     const Vec3 &pair_vertex,
+                                     const Vec3 &sv_mom1, const Vec3 &sv_mom2,
+                                     double pair_dca, bool have_secondary_pca) const;
+    bool sitpc_helix_pca_to_xy(const Tracklet &tracklet, const Vec3 &vertex,
+                               Vec3 &pca, Vec3 &momentum) const;
     void run_pair_stage(const std::vector<const Tracklet *> &tracklets,
                         const Vec3 &primary_vertex,
                         int run_number, int event_number,
@@ -1677,6 +1811,31 @@ namespace tpchadronreco
     double m_sigma_r_intt_cm{0.0030};
     double m_sigma_z_intt_cm{0.50};
     DisplacedCuts m_d0_displaced_cuts;
+    struct D0VertexConfig
+    {
+      bool enabled{false};
+      unsigned int min_vertex_tracks{4};
+      bool exclude_daughters{true};
+      unsigned int min_other_tracks{2};
+      double max_sigma_xy_cm{-1.0};
+      unsigned int min_mvtx{3};
+      double max_match_dphi{0.05};
+      bool use_sitpc_helix{true};
+      // SiTpc_VertexFinder fit (hybrid xy setup of Fun4All_raw_hit_Poly_reco_pp.C)
+      double sigma_rphi_cm{0.002};
+      double sigma_z_cm{0.04};
+      double ms_term{0.006};
+      double max_track_chi2{16.0};
+      bool beam_constraint{true};
+      double beam_x_cm{0.0};
+      double beam_y_cm{0.0};
+      double beam_sigma_x_cm{0.013};
+      double beam_sigma_y_cm{0.013};
+    };
+    D0VertexConfig m_d0_vertex;
+    mutable std::shared_ptr<D0VertexCache> m_d0_cache;
+    mutable std::array<std::uint64_t, 8> m_counter_d0v_status{};
+    mutable std::uint64_t m_counter_d0v_refits{0};
     mutable std::uint64_t m_counter_sitpc_seen{0};
     mutable std::uint64_t m_counter_sitpc_reject_quality{0};
     mutable std::uint64_t m_counter_sitpc_reject_crossing{0};

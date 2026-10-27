@@ -1,0 +1,14 @@
+# Step 1: one job per group of 100 files, all four macros in one submission.
+#   ./make_merge_lists.sh
+#   condor_submit merge_groups.job
+Universe           = vanilla
+Initialdir         = /sphenix/user/mitrankova/TpcHadronReco/work
+Executable         = $(Initialdir)/merge_job.sh
+Arguments          = $(macro) $(ListFile)
+Output             = $(Initialdir)/log/merge_$(macro)_$(Process).out
+Error              = $(Initialdir)/log/merge_$(macro)_$(Process).err
+Log                = /tmp/merge_$(macro)_$(Process).log
+request_memory     = 4GB
+request_cpus       = 1
+Priority           = 20
+Queue macro, ListFile from merge_lists/groups.txt

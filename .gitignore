@@ -97,4 +97,6 @@ TpcProduction/*.txt
 *.png
 *.pdf
 build/
+log/
+merge_lists/
 TpcProduction/Fun4All_raw_hit_TPC_reco_Work.C
